@@ -1,0 +1,25 @@
+{
+  "name": "yocim-audio-cut",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "纯前端本地音频剪辑器 - Vue3 + Web Audio API",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc -b && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@breezystack/lamejs": "^1.2.7",
+    "pinia": "^3.0.1",
+    "vue": "^3.5.13"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.1.0",
+    "@vitejs/plugin-vue": "^6.0.0",
+    "tailwindcss": "^4.1.0",
+    "typescript": "~5.8.3",
+    "vite": "^7.0.0",
+    "vue-tsc": "^2.2.10"
+  }
+}
