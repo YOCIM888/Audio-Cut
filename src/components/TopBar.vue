@@ -2,10 +2,13 @@
 import { computed, ref } from 'vue'
 import { useEditorStore } from '../stores/editor'
 import { useAudioImporter } from '../composables/useAudioImporter'
+import { useProjectIO } from '../composables/useProjectIO'
 
 const editor = useEditorStore()
 const { importFiles } = useAudioImporter()
+const { saving, saveProject, loadProject } = useProjectIO()
 const fileInput = ref<HTMLInputElement | null>(null)
+const projectInput = ref<HTMLInputElement | null>(null)
 
 function pickFile(): void {
   fileInput.value?.click()
@@ -17,6 +20,13 @@ async function onFileChange(e: Event): Promise<void> {
   input.value = ''
 }
 
+async function onProjectChange(e: Event): Promise<void> {
+  const input = e.target as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = ''
+  if (file) await loadProject(file)
+}
+
 const busyLabel = computed(() => {
   switch (editor.busy.type) {
     case 'decode':
@@ -25,6 +35,10 @@ const busyLabel = computed(() => {
       return `变速处理 ${Math.round(editor.busy.progress)}%`
     case 'merge':
       return `合并中 ${Math.round(editor.busy.progress)}%`
+    case 'effects':
+      return '效果渲染中…'
+    case 'gate':
+      return `门限处理 ${Math.round(editor.busy.progress)}%`
     default:
       return ''
   }
@@ -66,6 +80,17 @@ const busyLabel = computed(() => {
       重做
     </button>
     <button class="btn" :disabled="editor.busy.type !== null" @click="pickFile">导入音频</button>
+    <button
+      class="btn"
+      :disabled="!editor.buffer || saving"
+      title="保存工程（内嵌 128kbps MP3 副本 + 选区与视图设置）"
+      @click="saveProject"
+    >
+      {{ saving ? '保存中…' : '保存工程' }}
+    </button>
+    <button class="btn" :disabled="editor.busy.type !== null" @click="projectInput?.click()">
+      打开工程
+    </button>
     <button class="btn btn-primary" :disabled="!editor.buffer" @click="editor.sidebarTab = 'export'">
       导出
     </button>
@@ -76,6 +101,13 @@ const busyLabel = computed(() => {
       accept=".mp3,.wav,.m4a,.ogg,.flac,audio/*"
       class="hidden"
       @change="onFileChange"
+    />
+    <input
+      ref="projectInput"
+      type="file"
+      accept=".json,application/json"
+      class="hidden"
+      @change="onProjectChange"
     />
   </header>
 </template>

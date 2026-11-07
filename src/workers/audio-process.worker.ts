@@ -2,6 +2,7 @@
  * 音频处理 Worker：
  *  - time-stretch：WSOLA 变速不变调（或纯重采样变速）
  *  - merge：多轨合并，支持静音间隔 / 等功率交叉淡化
+ *  - gate：门限降噪（包络跟随 + 平滑增益）
  */
 
 const scope = self as unknown as Worker
@@ -22,7 +23,14 @@ interface MergeRequest {
   sampleRate: number
 }
 
-type Request = TimeStretchRequest | MergeRequest
+interface GateRequest {
+  type: 'gate'
+  channels: Float32Array[]
+  sampleRate: number
+  thresholdDb: number
+}
+
+type Request = TimeStretchRequest | MergeRequest | GateRequest
 
 function postProgress(progress: number): void {
   scope.postMessage({ type: 'progress', progress })
@@ -95,7 +103,7 @@ function wsola(channels: Float32Array[], sampleRate: number, ratio: number): Flo
     }
   }
 
-  const finalLen = Math.min(filled, outLen)
+  const finalLen = Math.min(filled, outLen, Math.max(1, Math.round(n / ratio)))
   return out.map((o) => o.slice(0, finalLen))
 }
 
@@ -167,6 +175,40 @@ function merge(
   return out
 }
 
+/**
+ * 门限降噪：以多声道峰值求包络，15ms 衰减保持；
+ * 低于阈值时增益平滑关闭（40ms 释放），高于阈值时 5ms 快速打开。
+ */
+function gate(channels: Float32Array[], sampleRate: number, thresholdDb: number): Float32Array[] {
+  const n = channels[0].length
+  const out = channels.map(() => new Float32Array(n))
+  const threshold = Math.pow(10, thresholdDb / 20)
+  const envDecay = Math.exp(-1 / (sampleRate * 0.015))
+  const openCoef = Math.exp(-1 / (sampleRate * 0.005))
+  const closeCoef = Math.exp(-1 / (sampleRate * 0.040))
+  let env = 0
+  // 初始关闭：避免音频开头的本底噪声直接漏过
+  let gain = 0
+
+  for (let i = 0; i < n; i++) {
+    let peak = 0
+    for (let c = 0; c < channels.length; c++) {
+      const v = Math.abs(channels[c][i])
+      if (v > peak) peak = v
+    }
+    env = peak > env ? peak : env * envDecay
+    const target = env >= threshold ? 1 : 0
+    const coef = target > gain ? openCoef : closeCoef
+    gain = target + (gain - target) * coef
+    for (let c = 0; c < channels.length; c++) out[c][i] = channels[c][i] * gain
+
+    if ((i & 0xffff) === 0) {
+      postProgress(Math.min(99, Math.round((i / n) * 100)))
+    }
+  }
+  return out
+}
+
 scope.onmessage = (e: MessageEvent) => {
   try {
     const msg = e.data as Request
@@ -175,6 +217,8 @@ scope.onmessage = (e: MessageEvent) => {
       channels = msg.keepPitch
         ? wsola(msg.channels, msg.sampleRate, msg.ratio)
         : resampleFast(msg.channels, msg.ratio)
+    } else if (msg.type === 'gate') {
+      channels = gate(msg.channels, msg.sampleRate, msg.thresholdDb)
     } else {
       channels = merge(msg.clips, msg.gapSeconds, msg.crossfadeSeconds, msg.sampleRate)
     }

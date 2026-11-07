@@ -34,6 +34,15 @@ export function useKeyboardShortcuts(): void {
     } else if ((e.ctrlKey || e.metaKey) && (key === 'y' || (e.shiftKey && key === 'z'))) {
       e.preventDefault()
       editor.redo()
+    } else if ((e.ctrlKey || e.metaKey) && key === 'c' && editor.hasSelection) {
+      e.preventDefault()
+      editor.copySelection()
+    } else if ((e.ctrlKey || e.metaKey) && key === 'x' && editor.hasSelection) {
+      e.preventDefault()
+      editor.cutSelection()
+    } else if ((e.ctrlKey || e.metaKey) && key === 'v' && editor.hasClipboard) {
+      e.preventDefault()
+      void editor.pasteAtPlayhead()
     } else if (e.key === 'Delete' && editor.hasSelection) {
       e.preventDefault()
       editor.deleteRegion()

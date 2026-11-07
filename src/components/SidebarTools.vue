@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { ref } from 'vue'
 import { useEditorStore, type SidebarTab } from '../stores/editor'
+import EditPanel from './EditPanel.vue'
+import EffectsPanel from './EffectsPanel.vue'
 import MergePanel from './MergePanel.vue'
 import ExportPanel from './ExportPanel.vue'
 
@@ -8,6 +10,7 @@ const editor = useEditorStore()
 
 const tabs: { key: SidebarTab; label: string }[] = [
   { key: 'edit', label: '编辑' },
+  { key: 'effects', label: '处理' },
   { key: 'speed', label: '变速' },
   { key: 'merge', label: '合并' },
   { key: 'export', label: '导出' }
@@ -17,8 +20,6 @@ const ratio = ref(1)
 const keepPitch = ref(true)
 const onlySelection = ref(false)
 const presets = [0.5, 0.75, 1, 1.5, 2, 4]
-
-const editDisabled = () => !editor.hasSelection || editor.busy.type !== null
 
 async function applyStretch(): Promise<void> {
   await editor.timeStretch(ratio.value, keepPitch.value, onlySelection.value)
@@ -31,7 +32,7 @@ async function applyStretch(): Promise<void> {
       <button
         v-for="tab in tabs"
         :key="tab.key"
-        class="flex-1 py-2.5 text-xs tracking-[0.2em] transition-colors"
+        class="flex-1 py-2.5 text-xs tracking-[0.1em] transition-colors"
         :class="
           editor.sidebarTab === tab.key
             ? 'text-neon border-b-2 border-neon bg-neon/5 glow-text'
@@ -43,35 +44,12 @@ async function applyStretch(): Promise<void> {
       </button>
     </nav>
 
-    <div class="flex-1 overflow-y-auto p-4 space-y-4">
-      <!-- 编辑 -->
-      <template v-if="editor.sidebarTab === 'edit'">
-        <p class="text-xs text-slate-500 leading-relaxed">
-          在波形上拖拽框选区域（0.1s 吸附），Shift+拖动可移动选区，点击定位播放头。
-        </p>
-        <div class="grid grid-cols-2 gap-2">
-          <button class="btn btn-primary" :disabled="editDisabled()" @click="editor.trim()">
-            裁剪选区
-          </button>
-          <button class="btn btn-danger" :disabled="editDisabled()" @click="editor.deleteRegion()">
-            删除选区
-          </button>
-          <button class="btn" :disabled="editDisabled()" @click="editor.silence()">静音选区</button>
-          <button class="btn" :disabled="editDisabled()" @click="editor.clearSelection()">
-            清除选区
-          </button>
-          <button class="btn" :disabled="editDisabled()" @click="editor.fadeIn()">淡入</button>
-          <button class="btn" :disabled="editDisabled()" @click="editor.fadeOut()">淡出</button>
-        </div>
-        <div class="panel p-3 text-xs text-slate-500 space-y-1">
-          <p>快捷键：</p>
-          <p>Space 播放/暂停 · Home/End 跳首尾</p>
-          <p>Ctrl+Z 撤销 · Ctrl+Shift+Z 重做 · Del 删除选区</p>
-        </div>
-      </template>
+    <div class="flex-1 overflow-y-auto p-4">
+      <EditPanel v-if="editor.sidebarTab === 'edit'" />
 
-      <!-- 变速 -->
-      <template v-else-if="editor.sidebarTab === 'speed'">
+      <EffectsPanel v-else-if="editor.sidebarTab === 'effects'" />
+
+      <div v-else-if="editor.sidebarTab === 'speed'" class="space-y-4">
         <div>
           <label class="field-label">速度倍率</label>
           <div class="flex items-center gap-3">
@@ -115,21 +93,16 @@ async function applyStretch(): Promise<void> {
         >
           {{ editor.busy.type === 'stretch' ? `处理中 ${Math.round(editor.busy.progress)}%` : '应用变速' }}
         </button>
-        <div
-          v-if="editor.busy.type === 'stretch'"
-          class="h-1.5 rounded bg-abyss-800 overflow-hidden"
-        >
+        <div v-if="editor.busy.type === 'stretch'" class="h-1.5 rounded bg-abyss-800 overflow-hidden">
           <div
             class="h-full bg-neon shadow-glow transition-all"
             :style="{ width: `${editor.busy.progress}%` }"
           />
         </div>
-      </template>
+      </div>
 
-      <!-- 合并 -->
       <MergePanel v-else-if="editor.sidebarTab === 'merge'" />
 
-      <!-- 导出 -->
       <ExportPanel v-else />
     </div>
   </aside>

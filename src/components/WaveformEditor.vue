@@ -119,7 +119,7 @@ function drawWaveform(ctx: CanvasRenderingContext2D): void {
   const sr = buf.sampleRate
   const h = cssH - RULER_H
   const mid = RULER_H + h / 2
-  const amp = h / 2 - 8
+  const amp = (h / 2 - 8) * editor.vGain
 
   // 中线
   ctx.strokeStyle = 'rgba(34,211,238,0.18)'
@@ -172,7 +172,7 @@ function drawWaveform(ctx: CanvasRenderingContext2D): void {
     for (let c = 0; c < chCount; c++) {
       const data = buf.getChannelData(c)
       const cMid = RULER_H + chH * (c + 0.5)
-      const cAmp = chH / 2 - 6
+      const cAmp = (chH / 2 - 6) * editor.vGain
       ctx.beginPath()
       let started = false
       for (let x = 0; x < cssW; x++) {
@@ -353,6 +353,11 @@ function onPointerUp(e: PointerEvent): void {
 function onWheel(e: WheelEvent): void {
   e.preventDefault()
   if (!editor.buffer) return
+  if (e.altKey) {
+    editor.vGain = clamp(editor.vGain * (e.deltaY > 0 ? 0.85 : 1.18), 0.25, 8)
+    drawBase()
+    return
+  }
   if (e.shiftKey || Math.abs(e.deltaX) > Math.abs(e.deltaY)) {
     const delta = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY
     editor.scrollX += delta
@@ -368,6 +373,29 @@ function onWheel(e: WheelEvent): void {
   editor.zoom = z
   editor.scrollX = t * z - x
   clampScroll()
+  drawBase()
+}
+
+// ---------- 视图工具栏 ----------
+function fitAll(): void {
+  if (!editor.buffer) return
+  editor.zoom = clamp(cssW / Math.max(0.001, editor.buffer.duration), MIN_PX_PER_SEC, MAX_PX_PER_SEC)
+  editor.scrollX = 0
+  clampScroll()
+  drawBase()
+}
+
+function zoomToSelection(): void {
+  if (!editor.buffer || !editor.hasSelection) return
+  const len = Math.max(0.05, editor.selection.end - editor.selection.start)
+  editor.zoom = clamp(cssW / (len * 1.15), MIN_PX_PER_SEC, MAX_PX_PER_SEC)
+  editor.scrollX = Math.max(0, editor.selection.start * editor.zoom - cssW * 0.08)
+  clampScroll()
+  drawBase()
+}
+
+function nudgeVGain(factor: number): void {
+  editor.vGain = clamp(editor.vGain * factor, 0.25, 8)
   drawBase()
 }
 
@@ -387,7 +415,7 @@ onBeforeUnmount(() => {
 })
 
 watch(
-  () => [editor.zoom, editor.scrollX, editor.buffer, editor.peakCache] as const,
+  () => [editor.zoom, editor.scrollX, editor.vGain, editor.buffer, editor.peakCache] as const,
   () => {
     clampScroll()
     drawBase()
@@ -398,8 +426,14 @@ watch(
   () => editor.buffer,
   (b, old) => {
     if (b && b !== old) {
-      editor.zoom = cssW / Math.max(0.001, b.duration)
-      editor.scrollX = 0
+      if (editor.pendingView) {
+        // 工程加载已恢复视图，跳过自动适应
+        editor.pendingView = false
+      } else {
+        editor.zoom = cssW / Math.max(0.001, b.duration)
+        editor.scrollX = 0
+      }
+      drawBase()
     }
   }
 )
@@ -416,5 +450,32 @@ watch(
       @pointerup="onPointerUp"
       @pointercancel="onPointerUp"
     />
+
+    <div class="absolute right-2 top-8 z-10 flex items-center gap-1 panel bg-abyss-900/90 px-1.5 py-1">
+      <button class="btn px-1.5 py-0.5 text-[10px]" :disabled="!editor.buffer" @click="fitAll">
+        全览
+      </button>
+      <button
+        class="btn px-1.5 py-0.5 text-[10px]"
+        :disabled="!editor.hasSelection"
+        @click="zoomToSelection"
+      >
+        选区
+      </button>
+      <button class="btn px-1.5 py-0.5 text-[10px]" :disabled="!editor.buffer" @click="nudgeVGain(0.8)">
+        A−
+      </button>
+      <button class="btn px-1.5 py-0.5 text-[10px]" :disabled="!editor.buffer" @click="nudgeVGain(1.25)">
+        A+
+      </button>
+      <button
+        class="btn px-1.5 py-0.5 text-[10px] text-neon-bright"
+        :disabled="!editor.buffer"
+        title="重置振幅（Alt+滚轮可调）"
+        @click="nudgeVGain(1 / Math.max(0.01, editor.vGain))"
+      >
+        {{ Math.round(editor.vGain * 100) }}%
+      </button>
+    </div>
   </div>
 </template>
