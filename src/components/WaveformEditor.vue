@@ -32,6 +32,8 @@ let dragMode: DragMode = 'none'
 let anchorTime = 0
 let moveGrabOffset = 0
 let downX = 0
+/** 悬停读数位置（CSS px），普通变量，不进入响应式 */
+let hoverX: number | null = null
 
 const timeToX = (t: number) => t * editor.zoom - editor.scrollX
 const xToTime = (x: number) => (x + editor.scrollX) / editor.zoom
@@ -211,6 +213,34 @@ function drawOverlay(): void {
   ctx.clearRect(0, 0, cssW, cssH)
   if (!editor.buffer) return
 
+  // 悬停游标线 + 时间读数
+  if (hoverX !== null) {
+    const hx = Math.round(hoverX) + 0.5
+    ctx.save()
+    ctx.setLineDash([4, 4])
+    ctx.strokeStyle = 'rgba(148,163,184,0.5)'
+    ctx.lineWidth = 1
+    ctx.beginPath()
+    ctx.moveTo(hx, RULER_H)
+    ctx.lineTo(hx, cssH)
+    ctx.stroke()
+    ctx.restore()
+
+    const t = clamp(xToTime(hoverX), 0, editor.duration)
+    const label = formatTime(t)
+    ctx.font = '10px ui-monospace, monospace'
+    const w = ctx.measureText(label).width + 10
+    const lx = clamp(hoverX - w / 2, 2, Math.max(2, cssW - w - 2))
+    const ly = cssH - 20
+    ctx.fillStyle = 'rgba(4,6,12,0.88)'
+    ctx.fillRect(lx, ly, w, 15)
+    ctx.strokeStyle = 'rgba(34,211,238,0.35)'
+    ctx.strokeRect(lx + 0.5, ly + 0.5, w - 1, 14)
+    ctx.fillStyle = '#cbd5e1'
+    ctx.textAlign = 'left'
+    ctx.fillText(label, lx + 5, ly + 11)
+  }
+
   if (editor.hasSelection) {
     const x1 = timeToX(editor.selection.start)
     const x2 = timeToX(editor.selection.end)
@@ -304,6 +334,7 @@ function onPointerDown(e: PointerEvent): void {
 
 function onPointerMove(e: PointerEvent): void {
   const x = e.offsetX
+  hoverX = x
   if (dragMode === 'none') {
     if (editor.buffer && overlayCanvas.value) {
       let cursor = 'crosshair'
@@ -348,6 +379,10 @@ function onPointerUp(e: PointerEvent): void {
     editor.seek(xToTime(e.offsetX))
   }
   dragMode = 'none'
+}
+
+function onPointerLeave(): void {
+  if (dragMode === 'none') hoverX = null
 }
 
 function onWheel(e: WheelEvent): void {
@@ -449,6 +484,7 @@ watch(
       @pointermove="onPointerMove"
       @pointerup="onPointerUp"
       @pointercancel="onPointerUp"
+      @pointerleave="onPointerLeave"
     />
 
     <div class="absolute right-2 top-8 z-10 flex items-center gap-1 panel bg-abyss-900/90 px-1.5 py-1">

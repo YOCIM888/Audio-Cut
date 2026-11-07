@@ -27,6 +27,14 @@ watch(
   { immediate: true }
 )
 
+watch(
+  () => editor.hasSelection,
+  (v) => {
+    // 选区被清除后不能停留在「选区导出」，否则导出会直接抛错
+    if (!v && range.value === 'selection') range.value = 'all'
+  }
+)
+
 async function doExport(): Promise<void> {
   if (exporting.value || !editor.buffer) return
   exporting.value = true

@@ -62,23 +62,24 @@ class AudioEngine {
     src.buffer = this.buffer
     src.connect(this.gainNode!)
 
-    let durationArg: number | undefined
+    // 仅循环模式下才把选区当作循环边界；普通播放不受选区限制
     if (this.loop) {
       src.loop = true
       if (this.range) {
+        if (offset < this.range.start || offset >= this.range.end) offset = this.range.start
         src.loopStart = this.range.start
         src.loopEnd = this.range.end
+      } else {
+        src.loopStart = 0
+        src.loopEnd = dur
       }
-    } else if (this.range) {
-      if (offset >= this.range.end) offset = this.range.start
-      durationArg = Math.max(0, this.range.end - offset)
     }
 
     src.onended = () => {
       if (this.source !== src) return
       this.source = null
       this.playing = false
-      this.startOffset = this.range ? this.range.start : 0
+      this.startOffset = 0
       this.onEnded?.()
     }
 
@@ -86,8 +87,7 @@ class AudioEngine {
     this.startedAt = ctx.currentTime
     this.startOffset = offset
     this.playing = true
-    if (durationArg !== undefined) src.start(0, offset, durationArg)
-    else src.start(0, offset)
+    src.start(0, offset)
   }
 
   pause(): void {
@@ -100,7 +100,7 @@ class AudioEngine {
   stop(): void {
     this.stopSource()
     this.playing = false
-    this.startOffset = this.range ? this.range.start : 0
+    this.startOffset = 0
   }
 
   seek(t: number): void {
@@ -119,7 +119,12 @@ class AudioEngine {
       const ls = this.range ? this.range.start : 0
       const le = this.range ? this.range.end : dur
       const len = Math.max(1e-6, le - ls)
-      return ls + (elapsed % len)
+      const absolute = this.startOffset + elapsed
+      // 起播点已在循环区间之后：不会回绕，只播放到音轨结尾
+      if (this.startOffset >= le) return Math.min(dur, absolute)
+      // 起播点可能在循环区间中段，先走到 loopEnd 再进入循环
+      if (absolute <= le) return Math.min(absolute, dur)
+      return ls + ((absolute - le) % len)
     }
     return Math.min(dur, this.startOffset + elapsed)
   }
@@ -131,16 +136,22 @@ class AudioEngine {
     }
   }
 
+  /** 播放中切换循环时，必须同步更新正在播放的 source，否则会继续按旧状态循环 */
   setLoop(on: boolean): void {
     this.loop = on
+    if (this.source && this.playing) {
+      this.source.loop = on
+      this.source.loopStart = this.range ? this.range.start : 0
+      this.source.loopEnd = this.range ? this.range.end : this.buffer?.duration ?? 0
+    }
   }
 
   /** 设置循环区间；播放中实时更新 loopStart/loopEnd */
   setRange(range: LoopRange | null): void {
     this.range = range
-    if (this.source && this.playing && range) {
-      this.source.loopStart = range.start
-      this.source.loopEnd = range.end
+    if (this.source && this.playing) {
+      this.source.loopStart = range ? range.start : 0
+      this.source.loopEnd = range ? range.end : this.buffer?.duration ?? 0
     }
   }
 

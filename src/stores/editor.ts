@@ -47,11 +47,13 @@ export interface MergeClipInput {
   sampleRate: number
 }
 
-export type SidebarTab = 'edit' | 'effects' | 'speed' | 'merge' | 'export'
+export type SidebarTab = 'edit' | 'effects' | 'speed' | 'merge' | 'extract' | 'export'
 export type BusyType = 'decode' | 'stretch' | 'merge' | 'effects' | 'gate' | null
 export type FadeCurve = 'linear' | 'cosine' | 'exponential' | 'logarithmic'
 
 const MAX_HISTORY = 30
+/** 撤销栈总内存预算（字节）。长音频单个快照可达百 MB 级，仅靠步数限制会 OOM */
+const MAX_HISTORY_BYTES = 400 * 1024 * 1024
 
 let processWorker: Worker | null = null
 function getProcessWorker(): Worker {
@@ -106,11 +108,39 @@ export const useEditorStore = defineStore('editor', () => {
     }
   }
 
+  function snapshotBytes(snap: Snapshot): number {
+    let n = 0
+    for (const c of snap.channels) n += c.byteLength
+    return n
+  }
+
+  function totalHistoryBytes(): number {
+    let n = 0
+    for (const s of past) n += snapshotBytes(s)
+    for (const s of future) n += snapshotBytes(s)
+    return n
+  }
+
+  /** 同时按步数与字节预算裁剪；至少保留 1 个撤销快照 */
+  function trimHistory(): void {
+    while (past.length > MAX_HISTORY) past.shift()
+    while (future.length > MAX_HISTORY) future.shift()
+    let bytes = totalHistoryBytes()
+    while (past.length > 1 && bytes > MAX_HISTORY_BYTES) {
+      bytes -= snapshotBytes(past[0])
+      past.shift()
+    }
+    while (future.length > 0 && bytes > MAX_HISTORY_BYTES) {
+      bytes -= snapshotBytes(future[0])
+      future.shift()
+    }
+  }
+
   function pushHistory(): void {
     if (!buffer.value) return
     past.push(takeSnapshot())
-    if (past.length > MAX_HISTORY) past.shift()
     future.length = 0
+    trimHistory()
     historyVersion.value++
   }
 
@@ -134,8 +164,11 @@ export const useEditorStore = defineStore('editor', () => {
     syncLoopRange()
   }
 
+  /** 仅循环开启且存在选区时才把选区设为循环边界，普通播放不受选区限制 */
   function syncLoopRange(): void {
-    audioEngine.setRange(hasSelection.value ? { start: selection.start, end: selection.end } : null)
+    audioEngine.setRange(
+      isLooping.value && hasSelection.value ? { start: selection.start, end: selection.end } : null
+    )
   }
 
   /** 用已解码的 AudioBuffer 替换当前音轨（导入与工程加载共用） */
@@ -157,9 +190,11 @@ export const useEditorStore = defineStore('editor', () => {
       selection.start = 0
       selection.end = 0
     }
-    if (opts.zoom && opts.zoom > 0) zoom.value = opts.zoom
-    scrollX.value = opts.scrollX ?? 0
-    vGain.value = clamp(opts.vGain ?? 1, 0.25, 8)
+    if (opts.zoom !== undefined && Number.isFinite(opts.zoom)) {
+      zoom.value = clamp(opts.zoom, 0.5, 20000)
+    }
+    scrollX.value = Number.isFinite(opts.scrollX) ? Math.max(0, opts.scrollX!) : 0
+    vGain.value = clamp(Number.isFinite(opts.vGain) ? opts.vGain! : 1, 0.25, 8)
     pendingView.value = opts.zoom !== undefined
     syncLoopRange()
   }
@@ -202,10 +237,12 @@ export const useEditorStore = defineStore('editor', () => {
     return best >= 0 ? best : target
   }
 
-  function setSelection(start: number, end: number): void {
+  /** precise=true 时跳过 0.1s 网格吸附，用于面板内数值精确输入 */
+  function setSelection(start: number, end: number, precise = false): void {
+    if (!Number.isFinite(start) || !Number.isFinite(end)) return
     const dur = duration.value
-    let s = snapTime(Math.min(start, end))
-    let e = snapTime(Math.max(start, end))
+    let s = precise ? Math.min(start, end) : snapTime(Math.min(start, end))
+    let e = precise ? Math.max(start, end) : snapTime(Math.max(start, end))
     s = clamp(s, 0, dur)
     e = clamp(e, 0, dur)
     const buf = buffer.value
@@ -250,7 +287,7 @@ export const useEditorStore = defineStore('editor', () => {
   }
 
   function deleteRegion(): void {
-    if (!buffer.value || !hasSelection.value) return
+    if (!buffer.value || !hasSelection.value || busy.type) return
     const sr = buffer.value.sampleRate
     const all = getAllChannels(buffer.value)
     const s = Math.floor(selection.start * sr)
@@ -673,19 +710,22 @@ export const useEditorStore = defineStore('editor', () => {
 
   // ---- 撤销 / 重做 ----
   function undo(): void {
+    // 异步处理期间不允许撤销，否则会把半成品写入历史栈
+    if (busy.type) return
     const snap = past.pop()
     if (!snap) return
     if (buffer.value) future.push(takeSnapshot())
-    if (future.length > MAX_HISTORY) future.shift()
+    trimHistory()
     applyChannels(snap.channels, snap.sampleRate)
     historyVersion.value++
   }
 
   function redo(): void {
+    if (busy.type) return
     const snap = future.pop()
     if (!snap) return
     if (buffer.value) past.push(takeSnapshot())
-    if (past.length > MAX_HISTORY) past.shift()
+    trimHistory()
     applyChannels(snap.channels, snap.sampleRate)
     historyVersion.value++
   }

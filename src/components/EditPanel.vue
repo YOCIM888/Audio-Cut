@@ -14,14 +14,15 @@ const silenceSeconds = ref(1)
 watch(
   () => [editor.selection.start, editor.selection.end] as const,
   ([s, e]) => {
-    selStart.value = Number(s.toFixed(1))
-    selEnd.value = Number(e.toFixed(1))
+    selStart.value = Number(s.toFixed(2))
+    selEnd.value = Number(e.toFixed(2))
   },
   { immediate: true }
 )
 
 function applySelection(): void {
-  editor.setSelection(selStart.value, selEnd.value)
+  // 数值输入走精确模式，不被 0.1s 网格吸附吞掉精度
+  editor.setSelection(selStart.value, selEnd.value, true)
 }
 
 const busy = () => editor.busy.type !== null
@@ -44,13 +45,13 @@ const curves: { value: FadeCurve; label: string }[] = [
     <div>
       <label class="field-label">精确选区（秒）</label>
       <div class="flex items-center gap-2">
-        <input class="field-input" type="number" min="0" step="0.1" v-model.number="selStart" />
+        <input class="field-input" type="number" min="0" step="0.01" v-model.number="selStart" />
         <span class="text-slate-600 text-xs">→</span>
-        <input class="field-input" type="number" min="0" step="0.1" v-model.number="selEnd" />
+        <input class="field-input" type="number" min="0" step="0.01" v-model.number="selEnd" />
         <button class="btn px-2" :disabled="!editor.buffer" @click="applySelection">应用</button>
       </div>
       <p class="text-[11px] text-slate-600 mt-1">
-        时长 {{ (editor.selection.end - editor.selection.start).toFixed(1) }}s
+        时长 {{ (editor.selection.end - editor.selection.start).toFixed(2) }}s
       </p>
     </div>
 

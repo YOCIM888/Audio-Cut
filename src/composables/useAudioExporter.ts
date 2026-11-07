@@ -61,10 +61,11 @@ export function pickMimeType(kind: 'webm' | 'ogg'): { mime: string; ext: string 
 }
 
 function triggerDownload(blob: Blob, name: string, ext: string): void {
+  const safe = name.trim().replace(/[\\/:*?"<>|]+/g, '-') || 'audio'
   const url = URL.createObjectURL(blob)
   const a = document.createElement('a')
   a.href = url
-  a.download = `${name}.${ext}`
+  a.download = `${safe}.${ext}`
   document.body.appendChild(a)
   a.click()
   a.remove()
@@ -77,8 +78,14 @@ async function recordRealtime(
   mime: string,
   onProgress: (p: number) => void
 ): Promise<Blob> {
+  if (typeof MediaRecorder === 'undefined') {
+    throw new Error('当前浏览器不支持 MediaRecorder，请改用 WAV 或 MP3 导出')
+  }
   const actx = new AudioContext()
   try {
+    // 新建的 AudioContext 可能因自动播放策略处于 suspended，
+    // 不恢复的话实时录制会录到静音
+    if (actx.state === 'suspended') await actx.resume()
     let data = channels
     if (sampleRate !== actx.sampleRate) {
       data = await resampleChannels(channels, sampleRate, actx.sampleRate)
@@ -98,6 +105,7 @@ async function recordRealtime(
     }
 
     const duration = audioBuf.duration
+    if (!(duration > 0)) throw new Error('音频时长无效，无法实时录制')
     const t0 = performance.now()
     const timer = window.setInterval(() => {
       onProgress(Math.min(0.99, (performance.now() - t0) / 1000 / duration))
@@ -156,6 +164,7 @@ export function useAudioExporter() {
 
   async function exportAudio(opts: ExportOptions, onProgress: (p: number) => void): Promise<void> {
     const { channels, sampleRate } = await prepare(opts)
+    if (channels.length === 0 || channels[0].length === 0) throw new Error('导出内容为空')
     let blob: Blob
     let ext: string
 
