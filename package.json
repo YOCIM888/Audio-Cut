@@ -11,10 +11,12 @@
   },
   "dependencies": {
     "@breezystack/lamejs": "^1.2.7",
+    "@ffmpeg/ffmpeg": "^0.12.15",
     "pinia": "^3.0.1",
     "vue": "^3.5.13"
   },
   "devDependencies": {
+    "@ffmpeg/core": "^0.12.6",
     "@tailwindcss/vite": "^4.1.0",
     "@vitejs/plugin-vue": "^6.0.0",
     "tailwindcss": "^4.1.0",

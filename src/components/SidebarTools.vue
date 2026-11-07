@@ -4,6 +4,7 @@ import { useEditorStore, type SidebarTab } from '../stores/editor'
 import EditPanel from './EditPanel.vue'
 import EffectsPanel from './EffectsPanel.vue'
 import MergePanel from './MergePanel.vue'
+import VideoExtractPanel from './VideoExtractPanel.vue'
 import ExportPanel from './ExportPanel.vue'
 
 const editor = useEditorStore()
@@ -13,6 +14,7 @@ const tabs: { key: SidebarTab; label: string }[] = [
   { key: 'effects', label: '处理' },
   { key: 'speed', label: '变速' },
   { key: 'merge', label: '合并' },
+  { key: 'extract', label: '提取' },
   { key: 'export', label: '导出' }
 ]
 
@@ -103,7 +105,9 @@ async function applyStretch(): Promise<void> {
 
       <MergePanel v-else-if="editor.sidebarTab === 'merge'" />
 
-      <ExportPanel v-else />
+      <VideoExtractPanel v-else-if="editor.sidebarTab === 'extract'" />
+
+      <ExportPanel v-else-if="editor.sidebarTab === 'export'" />
     </div>
   </aside>
 </template>
