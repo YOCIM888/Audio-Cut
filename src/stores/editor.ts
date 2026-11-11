@@ -4,13 +4,13 @@
  * 绝不进入 Vue 深层响应式系统。
  *
  * 效果链是非破坏性的：chain 只存指令，音轨数据保持原始状态。
- * 撤销栈因此分两类快照——音频快照（含当时的链状态）与链快照（仅几十字节，
- * 不复制任何采样），使 Ctrl+Z 能同时撤销剪辑与效果参数改动。
+ * 撤销栈因此分两类——音频命令（只保存被替换区间的 before/after 片段）与链快照
+ * （仅几十字节，不复制任何采样），使 Ctrl+Z 能同时撤销剪辑与效果参数改动。
  */
 import { computed, reactive, ref, shallowRef, watch } from 'vue'
 import { defineStore } from 'pinia'
 import { audioEngine } from '../audio/engine'
-import { PeakCache } from '../audio/peaks'
+import { startPeakBuild, type PeakBuild, type PeakCache } from '../audio/peaks'
 import { useToastStore } from './toast'
 import { renderChain } from '../audio/effects'
 import {
@@ -28,9 +28,9 @@ import {
 } from '../audio/effect-chain'
 import {
   channelsToAudioBuffer,
-  concatChannels,
   convertChannels,
   getAllChannels,
+  replaceAudioRegion,
   resampleChannels,
   sliceChannels,
   snapTime,
@@ -39,12 +39,21 @@ import {
 import { runProcessTask } from '../utils/process-worker'
 import { setSourceFile } from '../utils/source-file'
 
-/** 音频快照：一次剪辑动作前的完整音轨 + 当时的效果链 */
-interface AudioSnapshot {
+/**
+ * 音频命令：一次剪辑只记录「在 start 处用 after 替换掉 before」这一区间，
+ * 不再复制整条音轨。before/after 长度可以不同，因此插入、删除、变速同样适用。
+ * 约定：传入的数组必须是专有的新拷贝，命令持有后不再被外部修改。
+ */
+interface AudioCommand {
   kind: 'audio'
-  channels: Float32Array[]
+  start: number
+  before: Float32Array[]
+  after: Float32Array[]
   sampleRate: number
-  chain: EffectChainState
+  chainBefore: EffectChainState
+  chainAfter: EffectChainState
+  selectionBefore: { start: number; end: number }
+  positionBefore: number
 }
 
 /** 链快照：只记录前后两份指令，体积可忽略 */
@@ -54,7 +63,7 @@ interface ChainSnapshot {
   after: EffectChainState
 }
 
-export type Snapshot = AudioSnapshot | ChainSnapshot
+export type Snapshot = AudioCommand | ChainSnapshot
 
 export interface LoadOptions {
   selection?: { start: number; end: number }
@@ -93,8 +102,10 @@ export type BusyType = 'decode' | 'stretch' | 'merge' | 'effects' | null
 export type FadeCurve = 'linear' | 'cosine' | 'exponential' | 'logarithmic'
 
 const MAX_HISTORY = 30
-/** 撤销栈总内存预算（字节）。长音频单个快照可达百 MB 级，仅靠步数限制会 OOM */
-const MAX_HISTORY_BYTES = 400 * 1024 * 1024
+/** 撤销栈总内存预算（字节）。命令式历史只存改动片段，预算相应收紧 */
+const MAX_HISTORY_BYTES = 192 * 1024 * 1024
+/** 等长编辑时，超过此帧数就不再主线程局部刷新峰值，交给 Worker 全量重建 */
+const PEAK_REFRESH_FRAME_LIMIT = 4_000_000
 /** 拖动滑杆的合并窗口：停止操作后 450ms 才记为一次撤销 */
 const CHAIN_COMMIT_DELAY = 450
 
@@ -104,6 +115,9 @@ export const useEditorStore = defineStore('editor', () => {
   // ---- 状态（大对象一律 shallowRef） ----
   const buffer = shallowRef<AudioBuffer | null>(null)
   const peakCache = shallowRef<PeakCache | null>(null)
+  /** 增量峰值构建的版本号：普通数值，供波形组件 watch 后重绘 */
+  const peakVersion = ref(0)
+  const peakProgress = ref(1)
   const fileName = ref<string | null>(null)
   const selection = reactive({ start: 0, end: 0 })
   const zoom = ref(80) // px / 秒
@@ -129,6 +143,9 @@ export const useEditorStore = defineStore('editor', () => {
   const historyVersion = ref(0)
   let pendingChainBefore: EffectChainState | null = null
   let chainTimer: number | null = null
+  let peakBuild: PeakBuild | null = null
+  /** 长任务（效果固化）的取消令牌 */
+  let processingController: AbortController | null = null
 
   const duration = computed(() => buffer.value?.duration ?? 0)
   const hasSelection = computed(() => selection.end - selection.start > 1e-4)
@@ -146,20 +163,11 @@ export const useEditorStore = defineStore('editor', () => {
   }
 
   // ---- 内部工具 ----
-  function takeSnapshot(): AudioSnapshot {
-    const buf = buffer.value!
-    return {
-      kind: 'audio',
-      channels: getAllChannels(buf).map((c) => c.slice()),
-      sampleRate: buf.sampleRate,
-      chain: cloneChain(chain.value)
-    }
-  }
-
   function snapshotBytes(snap: Snapshot): number {
     if (snap.kind !== 'audio') return 0
     let n = 0
-    for (const c of snap.channels) n += c.byteLength
+    for (const c of snap.before) n += c.byteLength
+    for (const c of snap.after) n += c.byteLength
     return n
   }
 
@@ -250,33 +258,133 @@ export const useEditorStore = defineStore('editor', () => {
     chain.value = cloneChain(state)
   }
 
-  function pushHistory(): void {
-    if (!buffer.value) return
-    flushChainHistory()
-    past.push(takeSnapshot())
-    future.length = 0
-    trimHistory()
-    historyVersion.value++
-  }
-
   function stopPlayback(): void {
     audioEngine.stop()
     isPlaying.value = false
   }
 
-  function applyChannels(channels: Float32Array[], sampleRate: number): void {
-    stopPlayback()
-    const buf = channelsToAudioBuffer(channels, sampleRate)
-    buffer.value = buf
-    peakCache.value = new PeakCache(buf)
-    audioEngine.setBuffer(buf)
-    selection.start = clamp(selection.start, 0, buf.duration)
-    selection.end = clamp(selection.end, 0, buf.duration)
+  /** 长音频峰值放 Worker 分块构建，短音频同步完成；旧任务会被取消 */
+  function rebuildPeaks(buf: AudioBuffer): void {
+    peakBuild?.cancel()
+    const build = startPeakBuild(buf, {
+      onChunk: () => {
+        peakVersion.value++
+      },
+      onProgress: (p) => {
+        peakProgress.value = p
+      }
+    })
+    peakBuild = build
+    peakCache.value = build.cache
+    peakProgress.value = build.cache.progress
+    peakVersion.value++
+    void build.done.then((final) => {
+      if (peakBuild !== build) return
+      peakCache.value = final
+      peakProgress.value = final.progress
+      peakVersion.value++
+      peakBuild = null
+    })
+  }
+
+  /**
+   * 局部替换并保留播放上下文：不再 stop() 把播放头归零，
+   * 剪辑后仍在原时间点继续播放，选区按新时长裁剪。
+   */
+  function applyAudioData(
+    start: number,
+    removeFrames: number,
+    inserted: Float32Array[]
+  ): void {
+    const oldBuf = buffer.value
+    if (!oldBuf) return
+    const wasPlaying = audioEngine.isPlaying
+    const pos = audioEngine.getPosition()
+
+    const newBuf = replaceAudioRegion(oldBuf, start, removeFrames, inserted)
+    buffer.value = newBuf
+    audioEngine.setBuffer(newBuf)
+    const target = clamp(pos, 0, Math.max(0, newBuf.duration - 0.001))
+    audioEngine.seek(target)
+    if (wasPlaying) {
+      audioEngine.play(target)
+      isPlaying.value = true
+    } else {
+      isPlaying.value = false
+    }
+
+    const cache = peakCache.value
+    const changedFrames = inserted[0]?.length ?? 0
+    const refreshed =
+      newBuf.length === oldBuf.length &&
+      changedFrames <= PEAK_REFRESH_FRAME_LIMIT &&
+      cache?.refreshRegion(newBuf, start, start + changedFrames)
+    if (refreshed) {
+      // 局部刷新：只重算改动区间，长音频无需重建整条金字塔
+      peakVersion.value++
+    } else {
+      rebuildPeaks(newBuf)
+    }
+
+    selection.start = clamp(selection.start, 0, newBuf.duration)
+    selection.end = clamp(selection.end, 0, newBuf.duration)
     if (selection.end <= selection.start) {
       selection.start = 0
       selection.end = 0
     }
     syncLoopRange()
+  }
+
+  /** before / after 必须是专有拷贝；命令持有后不会被外部修改 */
+  function makeAudioCommand(
+    start: number,
+    before: Float32Array[],
+    after: Float32Array[],
+    chainAfter?: EffectChainState
+  ): AudioCommand {
+    return {
+      kind: 'audio',
+      start,
+      before,
+      after,
+      sampleRate: buffer.value!.sampleRate,
+      chainBefore: cloneChain(chain.value),
+      chainAfter: cloneChain(chainAfter ?? chain.value),
+      selectionBefore: { start: selection.start, end: selection.end },
+      positionBefore: audioEngine.getPosition()
+    }
+  }
+
+  /** 提交一条音频命令：入栈 + 局部应用 + 恢复操作后的链状态 */
+  function commitAudioCommand(cmd: AudioCommand): void {
+    flushChainHistory()
+    past.push(cmd)
+    future.length = 0
+    trimHistory()
+    historyVersion.value++
+    applyAudioData(cmd.start, cmd.before[0]?.length ?? 0, cmd.after)
+    restoreChain(cmd.chainAfter)
+  }
+
+  /** 撤销音频命令时把选区与播放头恢复到操作前，便于继续精细对点 */
+  function restoreCommandContext(cmd: AudioCommand): void {
+    const dur = duration.value
+    selection.start = clamp(cmd.selectionBefore.start, 0, dur)
+    selection.end = clamp(cmd.selectionBefore.end, 0, dur)
+    if (selection.end <= selection.start) {
+      selection.start = 0
+      selection.end = 0
+    }
+    audioEngine.seek(clamp(cmd.positionBefore, 0, dur))
+    syncLoopRange()
+  }
+
+  /** 导入 / 工程加载：新音轨从 0 开始，清空历史与旧的峰值构建任务 */
+  function installBuffer(decoded: AudioBuffer): void {
+    stopPlayback()
+    buffer.value = decoded
+    audioEngine.setBuffer(decoded)
+    rebuildPeaks(decoded)
   }
 
   /** 仅循环开启且存在选区时才把选区设为循环边界，普通播放不受选区限制 */
@@ -288,15 +396,14 @@ export const useEditorStore = defineStore('editor', () => {
 
   /** 用已解码的 AudioBuffer 替换当前音轨（导入与工程加载共用） */
   function loadDecodedBuffer(decoded: AudioBuffer, name: string, opts: LoadOptions = {}): void {
-    stopPlayback()
+    processingController?.abort()
+    processingController = null
     past.length = 0
     future.length = 0
     clearPendingChain()
     historyVersion.value++
-    buffer.value = decoded
-    peakCache.value = new PeakCache(decoded)
+    installBuffer(decoded)
     fileName.value = name
-    audioEngine.setBuffer(decoded)
     chain.value = opts.chain ? sanitizeChain(opts.chain) : createDefaultChain()
     clipboard = null
     hasClipboard.value = false
@@ -433,34 +540,42 @@ export const useEditorStore = defineStore('editor', () => {
     }
     const nodes = enabledNodes(chain.value)
     const scopeToKeep = chain.value.scope
-    pushHistory()
+    const controller = new AbortController()
+    processingController = controller
     busy.type = 'effects'
     busy.progress = 0
     try {
-      const region = sliceChannels(getAllChannels(buf), s, e)
-      const processed = await renderChain(region, sr, nodes, (p) => {
-        busy.progress = Math.round(p)
-      })
-      let finalChannels = processed
-      if (useSel) {
-        const all = getAllChannels(buf)
-        finalChannels = concatChannels(
-          concatChannels(sliceChannels(all, 0, s), processed),
-          sliceChannels(all, e, buf.length)
-        )
-      }
-      applyChannels(finalChannels, sr)
-      chain.value = { ...createDefaultChain(), scope: scopeToKeep }
+      const before = sliceChannels(getAllChannels(buf), s, e)
+      const processed = await renderChain(
+        before,
+        sr,
+        nodes,
+        (p) => {
+          busy.progress = Math.round(p)
+        },
+        controller.signal
+      )
+      if (controller.signal.aborted) throw new DOMException('已取消', 'AbortError')
+      const chainAfter = { ...createDefaultChain(), scope: scopeToKeep }
+      commitAudioCommand(makeAudioCommand(s, before, processed, chainAfter))
       toast.push('success', `已把 ${nodes.length} 个效果写入音轨（可用 Ctrl+Z 还原）`)
     } catch (err) {
-      console.error(err)
-      past.pop()
-      historyVersion.value++
-      toast.push('error', '效果固化失败，音轨未改动')
+      if (controller.signal.aborted || (err instanceof DOMException && err.name === 'AbortError')) {
+        toast.push('info', '已取消效果固化')
+      } else {
+        console.error(err)
+        toast.push('error', '效果固化失败，音轨未改动')
+      }
     } finally {
+      if (processingController === controller) processingController = null
       busy.type = null
       busy.progress = 0
     }
+  }
+
+  /** 取消正在进行的离线效果渲染（固化） */
+  function cancelProcessing(): void {
+    processingController?.abort()
   }
 
   /** 链与选区变化时同步到播放引擎（无 AudioContext 时仅记录状态） */
@@ -562,46 +677,54 @@ export const useEditorStore = defineStore('editor', () => {
 
   // ---- 剪辑操作 ----
   function trim(): void {
-    if (!buffer.value || !hasSelection.value) return
-    pushHistory()
-    const sr = buffer.value.sampleRate
-    const channels = sliceChannels(
-      getAllChannels(buffer.value),
-      Math.floor(selection.start * sr),
-      Math.floor(selection.end * sr)
-    )
-    applyChannels(channels, sr)
+    const buf = buffer.value
+    if (!buf || !hasSelection.value) return
+    const sr = buf.sampleRate
+    const s = Math.floor(selection.start * sr)
+    const e = Math.floor(selection.end * sr)
+    const all = getAllChannels(buf)
+    // 裁剪本质是整条替换，历史仍需保留原音轨；其余剪辑都只保存改动区间
+    const before = sliceChannels(all, 0, buf.length)
+    const after = sliceChannels(all, s, e)
+    if (after[0]?.length === 0) {
+      toast.push('error', '选区为空，无法裁剪')
+      return
+    }
+    commitAudioCommand(makeAudioCommand(0, before, after))
     clearSelection()
     scrollX.value = 0
     toast.push('success', '已裁剪至选区')
   }
 
   function deleteRegion(): void {
-    if (!buffer.value || !hasSelection.value || busy.type) return
-    const sr = buffer.value.sampleRate
-    const all = getAllChannels(buffer.value)
+    const buf = buffer.value
+    if (!buf || !hasSelection.value || busy.type) return
+    const sr = buf.sampleRate
+    const all = getAllChannels(buf)
     const s = Math.floor(selection.start * sr)
     const e = Math.floor(selection.end * sr)
-    const merged = concatChannels(sliceChannels(all, 0, s), sliceChannels(all, e, buffer.value.length))
-    if (merged.length === 0 || merged[0].length === 0) {
+    const before = sliceChannels(all, s, e)
+    if (buf.length - before[0].length < 1) {
       toast.push('error', '不能删除整条音轨，请使用裁剪或重新导入')
       return
     }
-    pushHistory()
-    applyChannels(merged, sr)
+    // 删除操作的历史只保存「被删掉的片段」，插入端是零长度
+    const after = all.map(() => new Float32Array(0))
+    commitAudioCommand(makeAudioCommand(s, before, after))
     clearSelection()
     toast.push('success', '已删除选区')
   }
 
   function silence(): void {
-    if (!buffer.value || !hasSelection.value) return
-    pushHistory()
-    const sr = buffer.value.sampleRate
+    const buf = buffer.value
+    if (!buf || !hasSelection.value) return
+    const sr = buf.sampleRate
     const s = Math.floor(selection.start * sr)
     const e = Math.floor(selection.end * sr)
-    const channels = getAllChannels(buffer.value).map((c) => c.slice())
-    for (const c of channels) c.fill(0, s, e)
-    applyChannels(channels, sr)
+    const all = getAllChannels(buf)
+    const before = sliceChannels(all, s, e)
+    const after = all.map(() => new Float32Array(e - s))
+    commitAudioCommand(makeAudioCommand(s, before, after))
     toast.push('success', '选区已静音')
   }
 
@@ -629,20 +752,21 @@ export const useEditorStore = defineStore('editor', () => {
       toast.push('info', '请先框选需要淡入/淡出的区域')
       return
     }
-    pushHistory()
-    const sr = buffer.value.sampleRate
+    const buf = buffer.value
+    const sr = buf.sampleRate
     const s = Math.floor(selection.start * sr)
     const e = Math.floor(selection.end * sr)
-    const channels = getAllChannels(buffer.value).map((c) => c.slice())
+    const before = sliceChannels(getAllChannels(buf), s, e)
+    const after = before.map((c) => c.slice())
     const len = e - s
-    for (const c of channels) {
+    for (const c of after) {
       for (let i = 0; i < len; i++) {
         const t = len <= 1 ? 1 : i / (len - 1)
         const gain = kind === 'in' ? curveValue(curve, t) : curveValue(curve, 1 - t)
-        c[s + i] *= gain
+        c[i] *= gain
       }
     }
-    applyChannels(channels, sr)
+    commitAudioCommand(makeAudioCommand(s, before, after))
     toast.push('success', kind === 'in' ? '已应用淡入' : '已应用淡出')
   }
 
@@ -664,14 +788,10 @@ export const useEditorStore = defineStore('editor', () => {
       ? selection.start
       : clamp(audioEngine.getPosition(), 0, buf.duration)
     const at = Math.floor(atSec * sr)
-    pushHistory()
     const all = getAllChannels(buf)
-    const silence = all.map(() => new Float32Array(Math.round(secs * sr)))
-    const merged = concatChannels(
-      concatChannels(sliceChannels(all, 0, at), silence),
-      sliceChannels(all, at, buf.length)
-    )
-    applyChannels(merged, sr)
+    const before = all.map(() => new Float32Array(0))
+    const after = all.map(() => new Float32Array(Math.round(secs * sr)))
+    commitAudioCommand(makeAudioCommand(at, before, after))
     const endSec = Math.min(duration.value, atSec + secs)
     setSelection(atSec, endSec)
     audioEngine.seek(endSec)
@@ -710,19 +830,16 @@ export const useEditorStore = defineStore('editor', () => {
       return
     }
     const buf = buffer.value!
-    const sr = buf.sampleRate
-    const all = getAllChannels(buf)
-    const s = Math.floor(selection.start * sr)
-    const e = Math.floor(selection.end * sr)
-    const merged = concatChannels(sliceChannels(all, 0, s), sliceChannels(all, e, buf.length))
-    if (merged.length === 0 || merged[0].length === 0) {
+    const s = Math.floor(selection.start * buf.sampleRate)
+    const before = data.channels
+    if (buf.length - before[0].length < 1) {
       toast.push('error', '不能剪切整条音轨')
       return
     }
     clipboard = data
     hasClipboard.value = true
-    pushHistory()
-    applyChannels(merged, sr)
+    const after = getAllChannels(buf).map(() => new Float32Array(0))
+    commitAudioCommand(makeAudioCommand(s, before, after))
     clearSelection()
     toast.push('success', '已剪切选区')
   }
@@ -742,13 +859,8 @@ export const useEditorStore = defineStore('editor', () => {
       ? selection.start
       : clamp(audioEngine.getPosition(), 0, buf.duration)
     const at = Math.floor(atSec * sr)
-    pushHistory()
-    const all = getAllChannels(buf)
-    const merged = concatChannels(
-      concatChannels(sliceChannels(all, 0, at), clip),
-      sliceChannels(all, at, buf.length)
-    )
-    applyChannels(merged, sr)
+    const before = getAllChannels(buf).map(() => new Float32Array(0))
+    commitAudioCommand(makeAudioCommand(at, before, clip))
     const endSec = Math.min(duration.value, atSec + clip[0].length / sr)
     setSelection(atSec, endSec)
     audioEngine.seek(endSec)
@@ -763,18 +875,18 @@ export const useEditorStore = defineStore('editor', () => {
     const useSel = onlySelection && hasSelection.value
     const s = useSel ? Math.floor(selection.start * sr) : 0
     const e = useSel ? Math.floor(selection.end * sr) : buf.length
-    const channels = getAllChannels(buf).map((c) => c.slice())
+    const before = sliceChannels(getAllChannels(buf), s, e)
+    const after = before.map((c) => c.slice())
     let peak = 0
-    for (const c of channels) {
-      for (let i = s; i < e; i++) {
+    for (const c of after) {
+      for (let i = 0; i < c.length; i++) {
         const v = c[i] * gain
         c[i] = v
         const a = Math.abs(v)
         if (a > peak) peak = a
       }
     }
-    pushHistory()
-    applyChannels(channels, sr)
+    commitAudioCommand(makeAudioCommand(s, before, after))
     if (peak > 1) {
       toast.push('info', `${message}完成；峰值 ${(20 * Math.log10(peak)).toFixed(1)} dBFS 超过 0 dBFS，导出时会被限幅`)
     } else {
@@ -833,33 +945,24 @@ export const useEditorStore = defineStore('editor', () => {
       toast.push('error', '选区过短（< 0.05s），无法变速')
       return
     }
-    pushHistory()
     busy.type = 'stretch'
     busy.progress = 0
     try {
-      const region = sliceChannels(getAllChannels(buf), s, e)
+      const before = sliceChannels(getAllChannels(buf), s, e)
+      // Worker 会转移 buffer，历史要保留原始数据，因此另送一份副本进 Worker
+      const work = before.map((c) => c.slice())
       const result = await runProcessTask<{ channels: Float32Array[] }>(
-        { type: 'time-stretch', channels: region, sampleRate: sr, ratio, keepPitch },
-        region.map((c) => c.buffer as ArrayBuffer),
+        { type: 'time-stretch', channels: work, sampleRate: sr, ratio, keepPitch },
+        work.map((c) => c.buffer as ArrayBuffer),
         (p) => {
           busy.progress = p
         }
       )
-      let finalChannels = result.channels
-      if (useSel) {
-        const all = getAllChannels(buf)
-        finalChannels = concatChannels(
-          concatChannels(sliceChannels(all, 0, s), result.channels),
-          sliceChannels(all, e, buf.length)
-        )
-      }
-      applyChannels(finalChannels, sr)
+      commitAudioCommand(makeAudioCommand(s, before, result.channels))
       clearSelection()
       toast.push('success', `变速完成：${ratio.toFixed(2)}x${keepPitch ? '（保持音调）' : ''}`)
     } catch (err) {
       console.error(err)
-      past.pop()
-      historyVersion.value++
       toast.push('error', '变速处理失败')
     } finally {
       busy.type = null
@@ -870,7 +973,6 @@ export const useEditorStore = defineStore('editor', () => {
   // ---- 合并（Worker） ----
   async function mergeClips(clips: MergeClipInput[], gapSeconds: number, crossfadeSeconds: number): Promise<void> {
     if (clips.length === 0 || busy.type) return
-    pushHistory()
     busy.type = 'merge'
     busy.progress = 0
     try {
@@ -892,15 +994,18 @@ export const useEditorStore = defineStore('editor', () => {
           busy.progress = p
         }
       )
-      applyChannels(result.channels, targetRate)
+      if (buffer.value) {
+        const before = sliceChannels(getAllChannels(buffer.value), 0, buffer.value.length)
+        commitAudioCommand(makeAudioCommand(0, before, result.channels))
+      } else {
+        installBuffer(channelsToAudioBuffer(result.channels, targetRate))
+      }
       clearSelection()
       scrollX.value = 0
       fileName.value = fileName.value ? `${fileName.value}-merged` : 'merged'
       toast.push('success', `已合并 ${clips.length} 个片段并替换当前音轨`)
     } catch (err) {
       console.error(err)
-      past.pop()
-      historyVersion.value++
       toast.push('error', '合并失败')
     } finally {
       busy.type = null
@@ -916,9 +1021,10 @@ export const useEditorStore = defineStore('editor', () => {
     const snap = past.pop()
     if (!snap) return
     if (snap.kind === 'audio') {
-      future.push(takeSnapshot())
-      applyChannels(snap.channels, snap.sampleRate)
-      restoreChain(snap.chain)
+      future.push(snap)
+      applyAudioData(snap.start, snap.after[0]?.length ?? 0, snap.before)
+      restoreChain(snap.chainBefore)
+      restoreCommandContext(snap)
     } else {
       future.push(snap)
       restoreChain(snap.before)
@@ -933,9 +1039,9 @@ export const useEditorStore = defineStore('editor', () => {
     const snap = future.pop()
     if (!snap) return
     if (snap.kind === 'audio') {
-      past.push(takeSnapshot())
-      applyChannels(snap.channels, snap.sampleRate)
-      restoreChain(snap.chain)
+      past.push(snap)
+      applyAudioData(snap.start, snap.before[0]?.length ?? 0, snap.after)
+      restoreChain(snap.chainAfter)
     } else {
       past.push(snap)
       restoreChain(snap.after)
@@ -990,6 +1096,8 @@ export const useEditorStore = defineStore('editor', () => {
   return {
     buffer,
     peakCache,
+    peakVersion,
+    peakProgress,
     fileName,
     selection,
     zoom,
@@ -1040,6 +1148,7 @@ export const useEditorStore = defineStore('editor', () => {
     clearChain,
     loadChain,
     bounceChain,
+    cancelProcessing,
     audition,
     timeStretch,
     mergeClips,

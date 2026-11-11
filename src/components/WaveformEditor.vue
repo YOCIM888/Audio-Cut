@@ -1,9 +1,10 @@
 <script setup lang="ts">
 /**
  * 波形编辑器：
- *  - 双 Canvas：底层波形+时间标尺（按需重绘），上层选区+播放头（rAF 每帧重绘）
- *  - 峰值金字塔渲染，支持滚轮缩放（光标锚点）、横向滚动、0.1s 吸附框选、
- *    选区边缘拖拽、Shift 拖动选区、点击定位播放头、播放自动跟随
+ *  - 双 Canvas：底层波形+时间标尺（按需重绘），上层选区+播放头（脏标记按需重绘）
+ *  - 峰值金字塔由 Worker 分块构建，构建期间逐块渐进显示
+ *  - 支持滚轮缩放（光标锚点）、横向滚动、0.1s 吸附框选、选区边缘拖拽、
+ *    Shift 拖动选区、点击定位播放头、播放自动跟随
  */
 import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useEditorStore } from '../stores/editor'
@@ -26,6 +27,9 @@ let cssW = 0
 let cssH = 0
 let raf = 0
 let resizeObserver: ResizeObserver | null = null
+/** overlay 只在状态变化或播放时重绘，暂停且无悬停时不再每帧全量绘制 */
+let overlayDirty = true
+let lastPlayheadX = Number.NaN
 
 type DragMode = 'none' | 'maybe' | 'select' | 'edge-l' | 'edge-r' | 'move'
 let dragMode: DragMode = 'none'
@@ -62,6 +66,8 @@ function resize(): void {
   baseCtx?.setTransform(dpr, 0, 0, dpr, 0, 0)
   ovCtx?.setTransform(dpr, 0, 0, dpr, 0, 0)
   clampScroll()
+  overlayDirty = true
+  lastPlayheadX = Number.NaN
   drawBase()
 }
 
@@ -79,6 +85,17 @@ function drawBase(): void {
     return
   }
   drawWaveform(ctx)
+  const cache = editor.peakCache
+  if (cache && !cache.complete) {
+    const label = `波形构建中 ${Math.round(cache.progress * 100)}%`
+    ctx.font = '11px ui-monospace, monospace'
+    ctx.textAlign = 'left'
+    const w = ctx.measureText(label).width + 14
+    ctx.fillStyle = 'rgba(4,6,12,0.85)'
+    ctx.fillRect(8, cssH - 24, w, 18)
+    ctx.fillStyle = '#67e8f9'
+    ctx.fillText(label, 15, cssH - 11)
+  }
 }
 
 function drawRuler(ctx: CanvasRenderingContext2D): void {
@@ -294,12 +311,19 @@ function drawOverlay(): void {
 }
 
 function frame(): void {
-  drawOverlay()
+  const playheadX = Math.round(timeToX(audioEngine.getPosition()) * 2) / 2
+  // 暂停且无状态变化时，播放头位置不变，跳过整帧 overlay 绘制
+  if (overlayDirty || editor.isPlaying || playheadX !== lastPlayheadX) {
+    drawOverlay()
+    overlayDirty = false
+    lastPlayheadX = playheadX
+  }
   if (editor.isPlaying && editor.buffer) {
     const x = timeToX(audioEngine.getPosition())
     if (x < 0 || x > cssW) {
       editor.scrollX = audioEngine.getPosition() * editor.zoom - cssW * 0.15
       clampScroll()
+      overlayDirty = true
       drawBase()
     }
   }
@@ -334,6 +358,7 @@ function onPointerDown(e: PointerEvent): void {
 
 function onPointerMove(e: PointerEvent): void {
   const x = e.offsetX
+  if (hoverX !== x) overlayDirty = true
   hoverX = x
   if (dragMode === 'none') {
     if (editor.buffer && overlayCanvas.value) {
@@ -382,7 +407,10 @@ function onPointerUp(e: PointerEvent): void {
 }
 
 function onPointerLeave(): void {
-  if (dragMode === 'none') hoverX = null
+  if (dragMode === 'none' && hoverX !== null) {
+    hoverX = null
+    overlayDirty = true
+  }
 }
 
 function onWheel(e: WheelEvent): void {
@@ -450,10 +478,33 @@ onBeforeUnmount(() => {
 })
 
 watch(
-  () => [editor.zoom, editor.scrollX, editor.vGain, editor.buffer, editor.peakCache] as const,
+  () =>
+    [
+      editor.zoom,
+      editor.scrollX,
+      editor.vGain,
+      editor.buffer,
+      editor.peakCache,
+      editor.peakVersion
+    ] as const,
   () => {
+    overlayDirty = true
     clampScroll()
     drawBase()
+  }
+)
+
+// 选区与播放状态不改变播放头坐标，但 overlay 内容必须重绘
+watch(
+  () =>
+    [
+      editor.selection.start,
+      editor.selection.end,
+      editor.hasSelection,
+      editor.isPlaying
+    ] as const,
+  () => {
+    overlayDirty = true
   }
 )
 

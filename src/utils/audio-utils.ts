@@ -59,6 +59,37 @@ export function channelsToAudioBuffer(channels: Float32Array[], sampleRate: numb
   return buffer
 }
 
+/**
+ * 局部替换 [start, start + removeFrames)：只分配一块新 AudioBuffer，
+ * 不产生「全曲 Float32Array 中间拷贝」，因此一次编辑最多两份内存（新音轨 + 历史片段）。
+ * inserted 为 planar 声道数据，长度可与 removeFrames 不同（支持插入与删除）。
+ */
+export function replaceAudioRegion(
+  buffer: AudioBuffer,
+  start: number,
+  removeFrames: number,
+  inserted: Float32Array[]
+): AudioBuffer {
+  const s = clamp(Math.floor(start), 0, buffer.length)
+  const r = clamp(Math.floor(removeFrames), 0, buffer.length - s)
+  const insertLen = inserted[0]?.length ?? 0
+  const length = Math.max(1, buffer.length - r + insertLen)
+  const out = new AudioBuffer({
+    numberOfChannels: buffer.numberOfChannels,
+    length,
+    sampleRate: buffer.sampleRate
+  })
+  for (let c = 0; c < buffer.numberOfChannels; c++) {
+    const src = buffer.getChannelData(c)
+    const dst = out.getChannelData(c)
+    dst.set(src.subarray(0, s), 0)
+    const ins = inserted[Math.min(c, Math.max(0, inserted.length - 1))]
+    if (ins && insertLen > 0) dst.set(ins.subarray(0, insertLen), s)
+    dst.set(src.subarray(s + r), s + insertLen)
+  }
+  return out
+}
+
 /** 声道转换：mono 混音平均 / stereo 复制补齐 */
 export function convertChannels(
   channels: Float32Array[],

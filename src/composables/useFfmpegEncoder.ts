@@ -96,7 +96,8 @@ async function encodeOnInstance(
   // 容器/编码器对多声道支持有限，统一降到立体声
   const pcm = channels.length > 2 ? convertChannels(channels, 'stereo') : channels
   hooks.onPhase('正在准备 PCM 数据…')
-  const wav = encodeWav(pcm, sampleRate, 16)
+  // 这是编码器的中间输入（尤其 FLAC 要求无损），不做抖动，保持逐位确定
+  const wav = encodeWav(pcm, sampleRate, 16, undefined, { dither: false })
   hooks.onProgress(0.2)
 
   const logs: string[] = []

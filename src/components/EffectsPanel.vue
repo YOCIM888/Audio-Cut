@@ -236,14 +236,23 @@ function releaseOriginal(): void {
     </div>
 
     <!-- 固化 / 清空 -->
-    <button
-      class="btn w-full py-2"
-      :disabled="!editor.chainActiveNow || busy || !editor.buffer"
-      title="按当前参数把效果写入音轨，之后可继续叠加新效果"
-      @click="editor.bounceChain()"
-    >
-      {{ editor.busy.type === 'effects' ? `渲染中 ${Math.round(editor.busy.progress)}%` : '写入音轨（固化效果）' }}
-    </button>
+    <div class="flex gap-2">
+      <button
+        class="btn flex-1 py-2"
+        :disabled="!editor.chainActiveNow || busy || !editor.buffer"
+        title="按当前参数把效果写入音轨，之后可继续叠加新效果"
+        @click="editor.bounceChain()"
+      >
+        {{ editor.busy.type === 'effects' ? `渲染中 ${Math.round(editor.busy.progress)}%` : '写入音轨（固化效果）' }}
+      </button>
+      <button
+        v-if="editor.busy.type === 'effects'"
+        class="btn btn-danger px-3 py-2"
+        @click="editor.cancelProcessing()"
+      >
+        取消
+      </button>
+    </div>
     <button class="btn btn-danger w-full" :disabled="!cards.length || busy" @click="editor.clearChain">
       清空效果链
     </button>

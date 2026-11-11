@@ -9,7 +9,12 @@
  */
 import { useEditorStore } from '../stores/editor'
 import { useToastStore } from '../stores/toast'
-import { encodeWav, type WavBitDepth } from '../utils/wav-encoder'
+import {
+  encodeWavBlob,
+  writeWavToHandle,
+  type WavBitDepth,
+  type WavSaveHandle
+} from '../utils/wav-encoder'
 import { writeId3v2, hasMetadata, type TrackMetadata } from '../utils/audio-metadata'
 import { chainActive, enabledNodes } from '../audio/effect-chain'
 import { renderChain } from '../audio/effects'
@@ -35,6 +40,10 @@ export interface ExportOptions {
   range: 'all' | 'selection'
   fileName: string
   metadata?: TrackMetadata
+  /** 16/24-bit WAV 的 TPDF 抖动，默认开启 */
+  dither?: boolean
+  /** 用户提供保存位置时，WAV 走流式写盘而不再触发下载 */
+  wavHandle?: WavSaveHandle | null
 }
 
 const FFMPEG_FORMATS: FfmpegAudioFormat[] = ['flac', 'm4a', 'ogg', 'webm']
@@ -51,6 +60,26 @@ function getMp3Worker(): Worker {
     })
   }
   return mp3Worker
+}
+
+function abortError(): DOMException {
+  return new DOMException('导出已取消', 'AbortError')
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw abortError()
+}
+
+/** 让不可中断的底层任务在中止时立即返回，后台工作自然结束后结果被丢弃 */
+function withAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise
+  if (signal.aborted) return Promise.reject(abortError())
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) => {
+      signal.addEventListener('abort', () => reject(abortError()), { once: true })
+    })
+  ])
 }
 
 function triggerDownload(blob: Blob, name: string, ext: string): void {
@@ -72,10 +101,12 @@ export function useAudioExporter() {
   async function prepare(
     opts: ExportOptions,
     onProgress: (p: number) => void,
-    onPhase?: (text: string) => void
+    onPhase?: (text: string) => void,
+    signal?: AbortSignal
   ): Promise<{ channels: Float32Array[]; sampleRate: number; chainRendered: boolean }> {
     const buf = editor.buffer
     if (!buf) throw new Error('没有可导出的音频')
+    throwIfAborted(signal)
     const sr = buf.sampleRate
     let regionStart = 0
     let channels: Float32Array[]
@@ -106,9 +137,13 @@ export function useAudioExporter() {
         onPhase?.('正在离线渲染效果链…')
         onProgress(0.02)
         const sub = sliceChannels(channels, lo, hi)
-        const rendered = await renderChain(sub, sr, enabledNodes(state), (p) => {
-          onProgress(0.02 + (p / 100) * 0.33)
-        })
+        const rendered = await renderChain(
+          sub,
+          sr,
+          enabledNodes(state),
+          (p) => onProgress(0.02 + (p / 100) * 0.33),
+          signal
+        )
         channels = concatChannels(
           concatChannels(sliceChannels(channels, 0, lo), rendered),
           sliceChannels(channels, hi, len)
@@ -117,21 +152,35 @@ export function useAudioExporter() {
       }
     }
 
+    throwIfAborted(signal)
     channels = convertChannels(channels, opts.channels)
     let outRate = sr
     if (opts.sampleRate && opts.sampleRate !== sr) {
-      channels = await resampleChannels(channels, sr, opts.sampleRate)
+      channels = await withAbort(resampleChannels(channels, sr, opts.sampleRate), signal)
       outRate = opts.sampleRate
     }
+    throwIfAborted(signal)
     return { channels, sampleRate: outRate, chainRendered }
   }
 
   async function exportAudio(
     opts: ExportOptions,
     onProgress: (p: number) => void,
-    onPhase?: (text: string) => void
+    onPhase?: (text: string) => void,
+    signal?: AbortSignal
   ): Promise<void> {
-    const { channels, sampleRate, chainRendered } = await prepare(opts, onProgress, onPhase)
+    // 取消后终止 MP3 Worker：否则旧任务的 done 消息可能串进下一次导出
+    signal?.addEventListener(
+      'abort',
+      () => {
+        if (mp3Worker) {
+          mp3Worker.terminate()
+          mp3Worker = null
+        }
+      },
+      { once: true }
+    )
+    const { channels, sampleRate, chainRendered } = await prepare(opts, onProgress, onPhase, signal)
     if (channels.length === 0 || channels[0].length === 0) throw new Error('导出内容为空')
     // 效果链渲染已占用前 35% 进度，编码阶段映射到剩余区间
     const base = chainRendered ? 0.35 : 0
@@ -140,20 +189,47 @@ export function useAudioExporter() {
     let ext: string
 
     if (opts.format === 'wav') {
-      onPhase?.('正在编码 WAV…')
-      report(0.3)
-      const wav = encodeWav(channels, sampleRate, opts.bitDepth, opts.metadata)
-      blob = new Blob([wav], { type: 'audio/wav' })
+      onPhase?.('正在分块编码 WAV…')
+      report(0.02)
+      const encOpts = {
+        dither: opts.dither !== false,
+        signal,
+        onProgress: (p: number) => report(p)
+      }
+      if (opts.wavHandle) {
+        await writeWavToHandle(
+          opts.wavHandle,
+          channels,
+          sampleRate,
+          opts.bitDepth,
+          opts.metadata,
+          encOpts
+        )
+        onPhase?.('')
+        report(1)
+        toast.push('success', 'WAV 已流式写入所选文件')
+        return
+      }
+      blob = await encodeWavBlob(
+        channels,
+        sampleRate,
+        opts.bitDepth,
+        opts.metadata,
+        encOpts
+      )
       ext = 'wav'
       report(1)
     } else if (opts.format === 'mp3') {
       onPhase?.('正在编码 MP3…')
       const payload = channels.slice(0, 2)
-      const data = await runWorkerTask<ArrayBuffer>(
-        getMp3Worker(),
-        { channels: payload, sampleRate, kbps: opts.bitrate },
-        payload.map((c) => c.buffer as ArrayBuffer),
-        (p) => report(p / 100)
+      const data = await withAbort(
+        runWorkerTask<ArrayBuffer>(
+          getMp3Worker(),
+          { channels: payload, sampleRate, kbps: opts.bitrate },
+          payload.map((c) => c.buffer as ArrayBuffer),
+          (p) => report(p / 100)
+        ),
+        signal
       )
       const withTags = hasMetadata(opts.metadata) ? writeId3v2(data, opts.metadata) : data
       blob = new Blob([withTags], { type: 'audio/mpeg' })
@@ -161,16 +237,19 @@ export function useAudioExporter() {
       report(1)
     } else if (isFfmpegFormat(opts.format)) {
       toast.push('info', 'ffmpeg 离线编码中（核心按需加载约 31MB，本地缓存后免下载）', 4500)
-      const result = await encodeWithFfmpeg(
-        channels,
-        sampleRate,
-        opts.format,
-        opts.bitrate,
-        opts.metadata,
-        {
-          onProgress: report,
-          onPhase: (text) => onPhase?.(text)
-        }
+      const result = await withAbort(
+        encodeWithFfmpeg(
+          channels,
+          sampleRate,
+          opts.format,
+          opts.bitrate,
+          opts.metadata,
+          {
+            onProgress: report,
+            onPhase: (text) => onPhase?.(text)
+          }
+        ),
+        signal
       )
       blob = result.blob
       ext = result.ext
@@ -178,6 +257,7 @@ export function useAudioExporter() {
       throw new Error('不支持的导出格式')
     }
 
+    throwIfAborted(signal)
     onPhase?.('')
     triggerDownload(blob, opts.fileName, ext)
   }

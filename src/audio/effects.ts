@@ -17,6 +17,26 @@ function setParam(param: AudioParam, value: number, smooth: boolean, now: number
   else param.value = value
 }
 
+export function abortError(): DOMException {
+  return new DOMException('离线渲染已取消', 'AbortError')
+}
+
+function assertNotAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw abortError()
+}
+
+/** 让长任务在中止信号触发时立刻返回；底层不可中断的渲染仍会自然结束 */
+function abortable<T>(work: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return work
+  assertNotAborted(signal)
+  return Promise.race([
+    work,
+    new Promise<never>((_, reject) => {
+      signal.addEventListener('abort', () => reject(abortError()), { once: true })
+    })
+  ])
+}
+
 /** 按规格创建一个 Web Audio 节点；gate 由 effect-graph 的 AudioWorklet 处理，这里返回 null */
 export function createEffectAudioNode(ctx: BaseAudioContext, spec: EffectNode): AudioNode | null {
   switch (spec.kind) {
@@ -84,12 +104,16 @@ export function updateEffectAudioNode(
 export async function renderNativeNodes(
   channels: Float32Array[],
   sampleRate: number,
-  nodes: EffectNode[]
+  nodes: EffectNode[],
+  onProgress?: (p: number) => void,
+  signal?: AbortSignal
 ): Promise<Float32Array[]> {
   const native = nodes.filter((n) => n.kind !== 'gate')
   if (native.length === 0 || channels.length === 0 || channels[0].length === 0) {
+    onProgress?.(1)
     return channels.map((c) => c.slice())
   }
+  assertNotAborted(signal)
   const length = channels[0].length
   const ctx = new OfflineAudioContext(channels.length, length, sampleRate)
   const buffer = ctx.createBuffer(channels.length, length, sampleRate)
@@ -107,7 +131,27 @@ export async function renderNativeNodes(
   tail.connect(ctx.destination)
   src.start()
 
-  const rendered = await ctx.startRendering()
+  // OfflineAudioContext 支持按时间点挂起：用检查点上报真实渲染进度，
+  // 长音频不再是「开始 → 一跳到 100%」。不支持 suspend 的浏览器自动忽略。
+  const seconds = length / sampleRate
+  const checkpoints = Math.min(32, Math.max(1, Math.ceil(seconds / 2)))
+  try {
+    for (let i = 1; i < checkpoints; i++) {
+      const at = (i * seconds) / checkpoints
+      void ctx
+        .suspend(at)
+        .then(() => {
+          onProgress?.(i / checkpoints)
+          void ctx.resume()
+        })
+        .catch(() => undefined)
+    }
+  } catch {
+    /* 旧实现不支持 suspend，仍然照常渲染 */
+  }
+
+  const rendered = await abortable(ctx.startRendering(), signal)
+  onProgress?.(1)
   const out: Float32Array[] = []
   for (let c = 0; c < channels.length; c++) out.push(rendered.getChannelData(c).slice())
   return out
@@ -147,32 +191,41 @@ export async function renderChain(
   channels: Float32Array[],
   sampleRate: number,
   specs: EffectNode[],
-  onProgress?: (p: number) => void
+  onProgress?: (p: number) => void,
+  signal?: AbortSignal
 ): Promise<Float32Array[]> {
   const active = specs.filter((n) => n.enabled)
   if (active.length === 0 || channels.length === 0 || channels[0].length === 0) {
     onProgress?.(100)
     return channels.map((c) => c.slice())
   }
+  assertNotAborted(signal)
 
   const runs = splitChainRuns(active)
   let current = channels.map((c) => c.slice())
   for (let i = 0; i < runs.length; i++) {
+    assertNotAborted(signal)
     const run = runs[i]
     const base = (i / runs.length) * 100
     const span = 100 / runs.length
     if (run.type === 'native') {
-      current = await renderNativeNodes(current, sampleRate, run.nodes)
-      onProgress?.(base + span)
+      current = await renderNativeNodes(
+        current,
+        sampleRate,
+        run.nodes,
+        (p) => onProgress?.(base + p * span),
+        signal
+      )
     } else {
-      const result = await runProcessTask<{ channels: Float32Array[] }>(
+      const work = runProcessTask<{ channels: Float32Array[] }>(
         { type: 'gate', channels: current, sampleRate, thresholdDb: run.node.thresholdDb },
         current.map((c) => c.buffer as ArrayBuffer),
         (p) => onProgress?.(base + (p / 100) * span)
       )
-      current = result.channels
-      onProgress?.(base + span)
+      current = (await abortable(work, signal)).channels
     }
+    assertNotAborted(signal)
+    onProgress?.(base + span)
   }
   onProgress?.(100)
   return current

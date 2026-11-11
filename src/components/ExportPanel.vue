@@ -5,7 +5,13 @@ import { useToastStore } from '../stores/toast'
 import { useAudioExporter, type ExportFormat } from '../composables/useAudioExporter'
 import { useProjectPersistence } from '../composables/useProjectPersistence'
 import type { TrackMetadata } from '../utils/audio-metadata'
-import type { WavBitDepth } from '../utils/wav-encoder'
+import {
+  canPickSaveFile,
+  pickWavSaveHandle,
+  type WavBitDepth,
+  type WavSaveHandle
+} from '../utils/wav-encoder'
+import { cancelActiveFfmpegTask } from '../utils/ffmpeg-core'
 
 const editor = useEditorStore()
 const toast = useToastStore()
@@ -34,10 +40,14 @@ const fileName = ref('')
 const progress = ref(0)
 const phaseText = ref('')
 const exporting = ref(false)
+const dither = ref(true)
+const streamToDisk = ref(false)
 const metadata = reactive<TrackMetadata>({ title: '', artist: '', album: '', year: '' })
+let exportController: AbortController | null = null
 
 const usesFfmpeg = computed(() => ['flac', 'm4a', 'ogg', 'webm'].includes(format.value))
 const usesBitrate = computed(() => ['mp3', 'm4a', 'ogg', 'webm'].includes(format.value))
+const canStream = computed(() => format.value === 'wav' && canPickSaveFile())
 
 watch(
   () => editor.fileName,
@@ -60,6 +70,19 @@ watch(
 
 async function doExport(): Promise<void> {
   if (exporting.value || !editor.buffer) return
+  // showSaveFilePicker 必须在用户手势的同步调用栈内发起，因此放在所有 await 之前
+  let handle: WavSaveHandle | null = null
+  if (format.value === 'wav' && streamToDisk.value && canPickSaveFile()) {
+    try {
+      handle = await pickWavSaveHandle(`${fileName.value.trim() || 'audio'}.wav`)
+    } catch (err) {
+      toast.push('error', err instanceof Error ? err.message : '无法选择保存位置')
+      return
+    }
+    if (!handle) return // 用户取消了文件选择
+  }
+  const controller = new AbortController()
+  exportController = controller
   exporting.value = true
   progress.value = 0
   phaseText.value = ''
@@ -73,24 +96,38 @@ async function doExport(): Promise<void> {
         bitrate: bitrate.value,
         range: range.value,
         fileName: fileName.value.trim() || 'audio',
-        metadata: { ...metadata }
+        metadata: { ...metadata },
+        dither: dither.value,
+        wavHandle: handle
       },
       (p) => {
         progress.value = p
       },
       (t) => {
         phaseText.value = t
-      }
+      },
+      controller.signal
     )
-    toast.push('success', '导出完成，已开始下载')
+    toast.push('success', handle ? '导出完成，已写入所选文件' : '导出完成，已开始下载')
   } catch (err) {
-    console.error(err)
-    toast.push('error', err instanceof Error ? err.message : '导出失败')
+    if (err instanceof DOMException && err.name === 'AbortError') {
+      toast.push('info', '已取消导出')
+    } else {
+      console.error(err)
+      toast.push('error', err instanceof Error ? err.message : '导出失败')
+    }
   } finally {
+    exportController = null
     exporting.value = false
     progress.value = 0
     phaseText.value = ''
   }
+}
+
+function cancelExport(): void {
+  exportController?.abort()
+  // 只在实际使用 ffmpeg 时终止共享实例，避免误伤同时进行的视频提取
+  if (usesFfmpeg.value) cancelActiveFfmpegTask()
 }
 </script>
 
@@ -129,13 +166,24 @@ async function doExport(): Promise<void> {
       </div>
     </div>
 
-    <div v-if="format === 'wav'">
+    <div v-if="format === 'wav'" class="space-y-1.5">
       <label class="field-label">位深</label>
       <select class="field-input" v-model.number="bitDepth">
         <option :value="16">16-bit PCM</option>
         <option :value="24">24-bit PCM</option>
-        <option :value="32">32-bit Float</option>
+        <option :value="32">32-bit Float（保留超 0 dBFS 动态范围）</option>
       </select>
+      <label class="flex items-center gap-1.5 cursor-pointer text-[11px] text-slate-300" :class="{ 'opacity-40': bitDepth === 32 }">
+        <input type="checkbox" v-model="dither" :disabled="bitDepth === 32" />
+        TPDF 抖动（16/24-bit 量化，降低低电平失真）
+      </label>
+      <label v-if="canStream" class="flex items-center gap-1.5 cursor-pointer text-[11px] text-slate-300">
+        <input type="checkbox" v-model="streamToDisk" />
+        大文件流式写盘（选择保存位置，内存占用与时长无关）
+      </label>
+      <p v-if="!canStream" class="text-[10px] text-slate-500">
+        当前浏览器不支持流式写盘，长音频将分块编码为 Blob 后下载。
+      </p>
     </div>
 
     <div v-if="usesBitrate">
@@ -190,13 +238,16 @@ async function doExport(): Promise<void> {
       <template v-if="editor.chain.bypass">当前为 A/B 旁路状态，导出将使用原声、不含效果。</template>
     </p>
 
-    <button
-      class="btn btn-primary w-full py-2"
-      :disabled="!editor.buffer || exporting || editor.busy.type !== null"
-      @click="doExport"
-    >
-      {{ exporting ? `导出中 ${Math.round(progress * 100)}%` : '开始导出' }}
-    </button>
+    <div class="flex gap-2">
+      <button
+        class="btn btn-primary flex-1 py-2"
+        :disabled="!editor.buffer || exporting || editor.busy.type !== null"
+        @click="doExport"
+      >
+        {{ exporting ? `导出中 ${Math.round(progress * 100)}%` : '开始导出' }}
+      </button>
+      <button v-if="exporting" class="btn btn-danger px-3 py-2" @click="cancelExport">取消</button>
+    </div>
 
     <p v-if="phaseText" class="text-[11px] text-neon-bright">{{ phaseText }}</p>
 
