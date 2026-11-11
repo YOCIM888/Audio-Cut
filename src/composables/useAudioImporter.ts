@@ -2,6 +2,7 @@
 import { ref } from 'vue'
 import { useEditorStore } from '../stores/editor'
 import { useToastStore } from '../stores/toast'
+import { isProjectFile, useProjectIO } from './useProjectIO'
 
 const ACCEPT_EXTENSIONS = ['.mp3', '.wav', '.m4a', '.ogg', '.flac']
 
@@ -18,12 +19,24 @@ export function useAudioImporter() {
   const toast = useToastStore()
 
   async function importFiles(files: File[]): Promise<void> {
+    const project = files.find(isProjectFile)
+    if (project) {
+      await useProjectIO().loadProject(project)
+      if (files.length > 1) toast.push('info', '已打开工程文件，其余拖入的文件未处理')
+      return
+    }
     const accepted = files.filter((f) =>
       ACCEPT_EXTENSIONS.some((ext) => f.name.toLowerCase().endsWith(ext))
     )
+    const rejected = files.length - accepted.length
     if (accepted.length === 0) {
-      toast.push('error', '不支持的格式，请选择 mp3 / wav / m4a / ogg / flac 文件')
+      toast.push('error', '不支持的格式，请选择 mp3 / wav / m4a / ogg / flac 文件或 .yac.zip 工程包')
       return
+    }
+    if (rejected > 0) toast.push('info', `已忽略 ${rejected} 个不支持的文件`, 3500)
+    // 编辑器是单音轨的，多余文件不再静默丢弃：明确告知，需要合并请走「合并」面板
+    if (accepted.length > 1) {
+      toast.push('info', `一次只能载入一个音频，已载入「${accepted[0].name}」；其余 ${accepted.length - 1} 个请在「合并」面板添加`, 5500)
     }
     await editor.loadFile(accepted[0])
   }

@@ -11,7 +11,7 @@ const editor = useEditorStore()
 
 const tabs: { key: SidebarTab; label: string }[] = [
   { key: 'edit', label: '编辑' },
-  { key: 'effects', label: '处理' },
+  { key: 'effects', label: '效果链' },
   { key: 'speed', label: '变速' },
   { key: 'merge', label: '合并' },
   { key: 'extract', label: '提取' },

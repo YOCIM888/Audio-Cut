@@ -1,4 +1,4 @@
-/** 全局快捷键：Space 播放/暂停，Home/End 跳转，Ctrl+Z / Ctrl+Shift+Z 撤销重做，Delete 删除选区 */
+/** 全局快捷键：Space 播放/暂停，B 切换效果链 A/B，Home/End 跳转，Ctrl+Z / Ctrl+Shift+Z 撤销重做，Delete 删除选区 */
 import { onBeforeUnmount, onMounted } from 'vue'
 import { useEditorStore } from '../stores/editor'
 
@@ -22,6 +22,9 @@ export function useKeyboardShortcuts(): void {
     if (e.code === 'Space') {
       e.preventDefault()
       editor.togglePlay()
+    } else if (key === 'b' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      e.preventDefault()
+      editor.toggleBypass()
     } else if (e.key === 'Home') {
       e.preventDefault()
       editor.seek(0)

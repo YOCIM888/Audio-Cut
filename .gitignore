@@ -7,5 +7,7 @@ yarn-debug.log*
 yarn-error.log*
 .idea
 .trae
+.trae-html-share-packages/
+.workbuddy/
 .vscode/*
 !.vscode/extensions.json

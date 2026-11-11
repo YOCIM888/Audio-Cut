@@ -3,12 +3,29 @@ import { computed, ref } from 'vue'
 import { useEditorStore } from '../stores/editor'
 import { useAudioImporter } from '../composables/useAudioImporter'
 import { useProjectIO } from '../composables/useProjectIO'
+import { useProjectPersistence } from '../composables/useProjectPersistence'
 
 const editor = useEditorStore()
 const { importFiles } = useAudioImporter()
-const { saving, saveProject, loadProject } = useProjectIO()
+const { saving, progress: saveProgress, saveProject, loadProject } = useProjectIO()
+const { status: saveStatus, statusLabel, statusTitle } = useProjectPersistence()
 const fileInput = ref<HTMLInputElement | null>(null)
 const projectInput = ref<HTMLInputElement | null>(null)
+
+const saveStatusClass = computed(() => {
+  switch (saveStatus.value) {
+    case 'error':
+      return 'text-danger'
+    case 'oversize':
+    case 'disabled':
+      return 'text-warn'
+    case 'saved':
+    case 'saving':
+      return 'text-neon/70'
+    default:
+      return 'text-slate-600'
+  }
+})
 
 function pickFile(): void {
   fileInput.value?.click()
@@ -36,9 +53,7 @@ const busyLabel = computed(() => {
     case 'merge':
       return `合并中 ${Math.round(editor.busy.progress)}%`
     case 'effects':
-      return '效果渲染中…'
-    case 'gate':
-      return `门限处理 ${Math.round(editor.busy.progress)}%`
+      return `效果渲染中 ${Math.round(editor.busy.progress)}%`
     default:
       return ''
   }
@@ -66,12 +81,27 @@ const busyLabel = computed(() => {
       </h1>
     </div>
 
-    <div class="flex-1 text-center text-xs text-slate-500 truncate">
-      <span v-if="editor.fileName" class="text-slate-200">{{ editor.fileName }}</span>
-      <span v-else>未加载音频 — 点击「导入音频」或直接拖拽文件到窗口</span>
+    <div class="flex-1 min-w-0 flex flex-col items-center justify-center gap-0.5 leading-tight">
+      <div class="text-xs text-slate-500 truncate max-w-full">
+        <span v-if="editor.fileName" class="text-slate-200">{{ editor.fileName }}</span>
+        <span v-else>未加载音频 — 点击「导入音频」或直接拖拽文件到窗口</span>
+      </div>
+      <div class="text-[10px] truncate max-w-full" :class="saveStatusClass" :title="statusTitle">
+        {{ statusLabel }}
+      </div>
     </div>
 
     <span v-if="editor.busy.type" class="text-xs text-neon-bright animate-pulse">{{ busyLabel }}</span>
+
+    <button
+      v-if="editor.chain.nodes.length"
+      class="btn"
+      :class="editor.chain.bypass ? 'text-warn' : 'btn-primary'"
+      :title="editor.chain.bypass ? '效果链已旁路，点击开启（B）' : '效果链生效中，点击旁路（B）'"
+      @click="editor.toggleBypass()"
+    >
+      FX {{ editor.activeEffectCount }}/{{ editor.chain.nodes.length }} · {{ editor.chain.bypass ? '原声' : '生效' }}
+    </button>
 
     <button class="btn" :disabled="!editor.canUndo || editor.busy.type !== null" @click="editor.undo()">
       撤销
@@ -83,10 +113,10 @@ const busyLabel = computed(() => {
     <button
       class="btn"
       :disabled="!editor.buffer || saving"
-      title="保存工程（内嵌 128kbps MP3 副本 + 选区与视图设置）"
+      title="导出无损工程包 .yac.zip（project.json 只存编辑指令，音轨为 32-bit float WAV）"
       @click="saveProject"
     >
-      {{ saving ? '保存中…' : '保存工程' }}
+      {{ saving ? `打包中 ${Math.round(saveProgress * 100)}%` : '保存工程' }}
     </button>
     <button class="btn" :disabled="editor.busy.type !== null" @click="projectInput?.click()">
       打开工程
@@ -105,7 +135,7 @@ const busyLabel = computed(() => {
     <input
       ref="projectInput"
       type="file"
-      accept=".json,application/json"
+      accept=".zip,.json,.yac.zip,application/zip,application/json"
       class="hidden"
       @change="onProjectChange"
     />

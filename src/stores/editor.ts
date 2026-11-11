@@ -2,12 +2,30 @@
  * 编辑器核心 Store。
  * 关键约束：AudioBuffer / PeakCache 使用 shallowRef，历史快照为普通数组，
  * 绝不进入 Vue 深层响应式系统。
+ *
+ * 效果链是非破坏性的：chain 只存指令，音轨数据保持原始状态。
+ * 撤销栈因此分两类快照——音频快照（含当时的链状态）与链快照（仅几十字节，
+ * 不复制任何采样），使 Ctrl+Z 能同时撤销剪辑与效果参数改动。
  */
-import { computed, reactive, ref, shallowRef } from 'vue'
+import { computed, reactive, ref, shallowRef, watch } from 'vue'
 import { defineStore } from 'pinia'
 import { audioEngine } from '../audio/engine'
 import { PeakCache } from '../audio/peaks'
 import { useToastStore } from './toast'
+import { renderChain } from '../audio/effects'
+import {
+  applyParamPatch,
+  chainActive,
+  chainSignature,
+  CHAIN_PRESETS,
+  cloneChain,
+  createDefaultChain,
+  createNode,
+  enabledNodes,
+  sanitizeChain,
+  type EffectChainState,
+  type EffectKind
+} from '../audio/effect-chain'
 import {
   channelsToAudioBuffer,
   concatChannels,
@@ -18,20 +36,43 @@ import {
   snapTime,
   clamp
 } from '../utils/audio-utils'
-import { runWorkerTask } from '../utils/worker-client'
-import { renderEffects, type EffectSettings } from '../audio/effects'
+import { runProcessTask } from '../utils/process-worker'
+import { setSourceFile } from '../utils/source-file'
 
-export interface Snapshot {
+/** 音频快照：一次剪辑动作前的完整音轨 + 当时的效果链 */
+interface AudioSnapshot {
+  kind: 'audio'
   channels: Float32Array[]
   sampleRate: number
+  chain: EffectChainState
 }
+
+/** 链快照：只记录前后两份指令，体积可忽略 */
+interface ChainSnapshot {
+  kind: 'chain'
+  before: EffectChainState
+  after: EffectChainState
+}
+
+export type Snapshot = AudioSnapshot | ChainSnapshot
 
 export interface LoadOptions {
   selection?: { start: number; end: number }
   zoom?: number
   scrollX?: number
   vGain?: number
+  chain?: EffectChainState
 }
+
+/** 工程/本地备份恢复时一并还原的界面标志位（不含音频与撤销栈） */
+export interface ViewState {
+  zeroSnap?: boolean
+  isLooping?: boolean
+  volume?: number
+  sidebarTab?: SidebarTab
+}
+
+const VALID_TABS: SidebarTab[] = ['edit', 'effects', 'speed', 'merge', 'extract', 'export']
 
 interface ClipboardData {
   channels: Float32Array[]
@@ -48,22 +89,14 @@ export interface MergeClipInput {
 }
 
 export type SidebarTab = 'edit' | 'effects' | 'speed' | 'merge' | 'extract' | 'export'
-export type BusyType = 'decode' | 'stretch' | 'merge' | 'effects' | 'gate' | null
+export type BusyType = 'decode' | 'stretch' | 'merge' | 'effects' | null
 export type FadeCurve = 'linear' | 'cosine' | 'exponential' | 'logarithmic'
 
 const MAX_HISTORY = 30
 /** 撤销栈总内存预算（字节）。长音频单个快照可达百 MB 级，仅靠步数限制会 OOM */
 const MAX_HISTORY_BYTES = 400 * 1024 * 1024
-
-let processWorker: Worker | null = null
-function getProcessWorker(): Worker {
-  if (!processWorker) {
-    processWorker = new Worker(new URL('../workers/audio-process.worker.ts', import.meta.url), {
-      type: 'module'
-    })
-  }
-  return processWorker
-}
+/** 拖动滑杆的合并窗口：停止操作后 450ms 才记为一次撤销 */
+const CHAIN_COMMIT_DELAY = 450
 
 export const useEditorStore = defineStore('editor', () => {
   const toast = useToastStore()
@@ -85,10 +118,17 @@ export const useEditorStore = defineStore('editor', () => {
   const sidebarTab = ref<SidebarTab>('edit')
   const busy = reactive({ type: null as BusyType, progress: 0 })
 
+  // ---- 非破坏性效果链（整体替换式更新，避免深层响应式代理） ----
+  const chain = ref<EffectChainState>(createDefaultChain())
+  const chainActiveNow = computed(() => chainActive(chain.value))
+  const activeEffectCount = computed(() => enabledNodes(chain.value).length)
+
   // ---- 历史栈（非响应式数组 + 版本号触发 computed） ----
   const past: Snapshot[] = []
   const future: Snapshot[] = []
   const historyVersion = ref(0)
+  let pendingChainBefore: EffectChainState | null = null
+  let chainTimer: number | null = null
 
   const duration = computed(() => buffer.value?.duration ?? 0)
   const hasSelection = computed(() => selection.end - selection.start > 1e-4)
@@ -98,17 +138,26 @@ export const useEditorStore = defineStore('editor', () => {
   audioEngine.onEnded = () => {
     isPlaying.value = false
   }
+  let gateWarned = false
+  audioEngine.onGateWorkletUnavailable = () => {
+    if (gateWarned) return
+    gateWarned = true
+    toast.push('info', '当前浏览器不支持 AudioWorklet，门限降噪仅在导出/固化时生效', 5000)
+  }
 
   // ---- 内部工具 ----
-  function takeSnapshot(): Snapshot {
+  function takeSnapshot(): AudioSnapshot {
     const buf = buffer.value!
     return {
+      kind: 'audio',
       channels: getAllChannels(buf).map((c) => c.slice()),
-      sampleRate: buf.sampleRate
+      sampleRate: buf.sampleRate,
+      chain: cloneChain(chain.value)
     }
   }
 
   function snapshotBytes(snap: Snapshot): number {
+    if (snap.kind !== 'audio') return 0
     let n = 0
     for (const c of snap.channels) n += c.byteLength
     return n
@@ -121,23 +170,89 @@ export const useEditorStore = defineStore('editor', () => {
     return n
   }
 
-  /** 同时按步数与字节预算裁剪；至少保留 1 个撤销快照 */
+  /** 按音频快照步数 + 字节预算裁剪；链快照只有几十字节，不占用音频撤销额度 */
   function trimHistory(): void {
-    while (past.length > MAX_HISTORY) past.shift()
-    while (future.length > MAX_HISTORY) future.shift()
+    const dropOldestAudio = (list: Snapshot[], limit: number) => {
+      while (list.filter((s) => s.kind === 'audio').length > limit) {
+        const i = list.findIndex((s) => s.kind === 'audio')
+        if (i < 0) break
+        list.splice(i, 1)
+      }
+    }
+    dropOldestAudio(past, MAX_HISTORY)
+    dropOldestAudio(future, MAX_HISTORY)
+    // 总条目硬上限，避免连续调整参数无限堆积链快照
+    while (past.length > MAX_HISTORY * 4) past.shift()
+    while (future.length > MAX_HISTORY * 4) future.shift()
     let bytes = totalHistoryBytes()
-    while (past.length > 1 && bytes > MAX_HISTORY_BYTES) {
-      bytes -= snapshotBytes(past[0])
-      past.shift()
+    while (bytes > MAX_HISTORY_BYTES) {
+      const count =
+        past.filter((s) => s.kind === 'audio').length +
+        future.filter((s) => s.kind === 'audio').length
+      if (count <= 1) break
+      const p = past.findIndex((s) => s.kind === 'audio')
+      const f = future.findIndex((s) => s.kind === 'audio')
+      if (p >= 0) {
+        bytes -= snapshotBytes(past[p])
+        past.splice(p, 1)
+      } else if (f >= 0) {
+        bytes -= snapshotBytes(future[f])
+        future.splice(f, 1)
+      } else break
     }
-    while (future.length > 0 && bytes > MAX_HISTORY_BYTES) {
-      bytes -= snapshotBytes(future[0])
-      future.shift()
+  }
+
+  /** 提交挂起的滑杆拖动，保证历史顺序与真实操作顺序一致 */
+  function flushChainHistory(): void {
+    if (chainTimer !== null) {
+      window.clearTimeout(chainTimer)
+      chainTimer = null
     }
+    const before = pendingChainBefore
+    pendingChainBefore = null
+    if (!before) return
+    const after = cloneChain(chain.value)
+    if (chainSignature(before) === chainSignature(after)) return
+    past.push({ kind: 'chain', before, after })
+    future.length = 0
+    trimHistory()
+    historyVersion.value++
+  }
+
+  function clearPendingChain(): void {
+    if (chainTimer !== null) window.clearTimeout(chainTimer)
+    chainTimer = null
+    pendingChainBefore = null
+  }
+
+  /** 记录一次链改动。coalesce=true 用于滑杆连续输入，合并为一次撤销 */
+  function mutateChain(fn: (draft: EffectChainState) => void, coalesce = false): void {
+    const before = cloneChain(chain.value)
+    const draft = cloneChain(before)
+    fn(draft)
+    if (chainSignature(before) === chainSignature(draft)) return
+    // 先结算挂起的滑杆拖动，其 after 应是本次离散操作之前的状态
+    if (!coalesce) flushChainHistory()
+    chain.value = draft
+    if (coalesce) {
+      if (!pendingChainBefore) pendingChainBefore = before
+      if (chainTimer !== null) window.clearTimeout(chainTimer)
+      chainTimer = window.setTimeout(() => flushChainHistory(), CHAIN_COMMIT_DELAY)
+    } else {
+      past.push({ kind: 'chain', before, after: cloneChain(draft) })
+      future.length = 0
+      trimHistory()
+      historyVersion.value++
+    }
+  }
+
+  function restoreChain(state: EffectChainState): void {
+    chain.value = cloneChain(state)
   }
 
   function pushHistory(): void {
     if (!buffer.value) return
+    flushChainHistory()
     past.push(takeSnapshot())
     future.length = 0
     trimHistory()
@@ -176,11 +291,13 @@ export const useEditorStore = defineStore('editor', () => {
     stopPlayback()
     past.length = 0
     future.length = 0
+    clearPendingChain()
     historyVersion.value++
     buffer.value = decoded
     peakCache.value = new PeakCache(decoded)
     fileName.value = name
     audioEngine.setBuffer(decoded)
+    chain.value = opts.chain ? sanitizeChain(opts.chain) : createDefaultChain()
     clipboard = null
     hasClipboard.value = false
     const dur = decoded.duration
@@ -199,6 +316,167 @@ export const useEditorStore = defineStore('editor', () => {
     syncLoopRange()
   }
 
+  /** 恢复界面标志位：循环/音量要同步到播放引擎，避免只改 ref 造成状态漂移 */
+  function applyViewState(state: ViewState): void {
+    if (typeof state.zeroSnap === 'boolean') zeroSnap.value = state.zeroSnap
+    if (typeof state.isLooping === 'boolean') {
+      isLooping.value = state.isLooping
+      audioEngine.setLoop(state.isLooping)
+      syncLoopRange()
+    }
+    if (typeof state.volume === 'number' && Number.isFinite(state.volume)) {
+      setVolume(clamp(state.volume, 0, 1))
+    }
+    if (state.sidebarTab && VALID_TABS.includes(state.sidebarTab)) sidebarTab.value = state.sidebarTab
+  }
+
+  // ---- 效果链动作 ----
+  function addEffect(kind: EffectKind): void {
+    mutateChain((d) => {
+      d.nodes.push(createNode(kind))
+    })
+  }
+
+  function removeEffect(id: string): void {
+    mutateChain((d) => {
+      d.nodes = d.nodes.filter((n) => n.id !== id)
+    })
+  }
+
+  function moveEffect(id: string, delta: -1 | 1): void {
+    mutateChain((d) => {
+      const i = d.nodes.findIndex((n) => n.id === id)
+      const j = i + delta
+      if (i < 0 || j < 0 || j >= d.nodes.length) return
+      const tmp = d.nodes[i]
+      d.nodes[i] = d.nodes[j]
+      d.nodes[j] = tmp
+    })
+  }
+
+  function setEffectEnabled(id: string, enabled: boolean): void {
+    mutateChain((d) => {
+      const n = d.nodes.find((x) => x.id === id)
+      if (n) n.enabled = enabled
+    })
+  }
+
+  function updateEffect(id: string, patch: Record<string, number | boolean>): void {
+    mutateChain((d) => {
+      const i = d.nodes.findIndex((n) => n.id === id)
+      if (i >= 0) d.nodes[i] = applyParamPatch(d.nodes[i], patch)
+    }, true)
+  }
+
+  function setBypass(value: boolean): void {
+    mutateChain((d) => {
+      d.bypass = value
+    })
+  }
+
+  function toggleBypass(): void {
+    setBypass(!chain.value.bypass)
+  }
+
+  /** 「按住听原声」的瞬时旁路：只改试听状态，不写入撤销栈 */
+  function previewBypass(value: boolean): void {
+    if (chain.value.bypass === value) return
+    chain.value = { ...cloneChain(chain.value), bypass: value }
+  }
+
+  function setEffectScope(scope: 'all' | 'selection'): void {
+    mutateChain((d) => {
+      d.scope = scope
+    })
+  }
+
+  function applyPreset(index: number): void {
+    const preset = CHAIN_PRESETS[index]
+    if (!preset) return
+    mutateChain((d) => {
+      const built = preset.build()
+      d.nodes = built.nodes
+      d.scope = built.scope
+      d.bypass = false
+    })
+    toast.push('success', `已载入预设「${preset.name}」`)
+  }
+
+  function clearChain(): void {
+    mutateChain((d) => {
+      d.nodes = []
+      d.bypass = false
+    })
+  }
+
+  /** 从工程文件恢复链（不产生撤销记录） */
+  function loadChain(raw: unknown): void {
+    clearPendingChain()
+    chain.value = sanitizeChain(raw)
+  }
+
+  /** 把当前链按作用范围固化进音轨，随后清空链；一次 Ctrl+Z 可完整还原 */
+  async function bounceChain(): Promise<void> {
+    const buf = buffer.value
+    if (!buf || busy.type) return
+    if (!chainActiveNow.value) {
+      toast.push('info', '效果链为空或已旁路，没有需要固化的效果')
+      return
+    }
+    const sr = buf.sampleRate
+    const useSel = chain.value.scope === 'selection' && hasSelection.value
+    const s = useSel ? Math.floor(selection.start * sr) : 0
+    const e = useSel ? Math.floor(selection.end * sr) : buf.length
+    if (e - s < 16) {
+      toast.push('error', '处理区域过短')
+      return
+    }
+    const nodes = enabledNodes(chain.value)
+    const scopeToKeep = chain.value.scope
+    pushHistory()
+    busy.type = 'effects'
+    busy.progress = 0
+    try {
+      const region = sliceChannels(getAllChannels(buf), s, e)
+      const processed = await renderChain(region, sr, nodes, (p) => {
+        busy.progress = Math.round(p)
+      })
+      let finalChannels = processed
+      if (useSel) {
+        const all = getAllChannels(buf)
+        finalChannels = concatChannels(
+          concatChannels(sliceChannels(all, 0, s), processed),
+          sliceChannels(all, e, buf.length)
+        )
+      }
+      applyChannels(finalChannels, sr)
+      chain.value = { ...createDefaultChain(), scope: scopeToKeep }
+      toast.push('success', `已把 ${nodes.length} 个效果写入音轨（可用 Ctrl+Z 还原）`)
+    } catch (err) {
+      console.error(err)
+      past.pop()
+      historyVersion.value++
+      toast.push('error', '效果固化失败，音轨未改动')
+    } finally {
+      busy.type = null
+      busy.progress = 0
+    }
+  }
+
+  /** 链与选区变化时同步到播放引擎（无 AudioContext 时仅记录状态） */
+  watch(
+    [chain, () => selection.start, () => selection.end, hasSelection],
+    () => {
+      audioEngine.setEffectChain(
+        chain.value,
+        chain.value.scope === 'selection' && hasSelection.value
+          ? { start: selection.start, end: selection.end }
+          : null
+      )
+    },
+    { immediate: true }
+  )
+
   // ---- 导入 ----
   async function loadFile(file: File): Promise<void> {
     if (busy.type) return
@@ -208,6 +486,8 @@ export const useEditorStore = defineStore('editor', () => {
       const bytes = await file.arrayBuffer()
       const decoded = await ctx.decodeAudioData(bytes)
       loadDecodedBuffer(decoded, file.name.replace(/\.[^.]+$/, ''))
+      // 保留未解码的原始文件：工程包归档与「重新解码」都用得上，且不会引入二次有损
+      setSourceFile({ blob: file, name: file.name })
       toast.push('success', `已加载 ${file.name}（${decoded.duration.toFixed(1)}s / ${decoded.numberOfChannels}ch / ${decoded.sampleRate}Hz）`)
     } catch (err) {
       console.error(err)
@@ -250,8 +530,18 @@ export const useEditorStore = defineStore('editor', () => {
       const sr = buf.sampleRate
       const radius = Math.round(sr * 0.02)
       const ch = buf.getChannelData(0)
-      s = clamp(findZeroCrossing(ch, Math.round(s * sr), radius) / sr, 0, dur)
-      e = clamp(findZeroCrossing(ch, Math.round(e * sr), radius) / sr, 0, dur)
+      const plainS = s
+      const plainE = e
+      const snappedS = findZeroCrossing(ch, Math.round(s * sr), radius) / sr
+      const snappedE = findZeroCrossing(ch, Math.round(e * sr), radius) / sr
+      // 起止点各自独立吸附可能重合甚至翻转，吸附后必须重新校验顺序
+      s = clamp(Math.min(snappedS, snappedE), 0, dur)
+      e = clamp(Math.max(snappedS, snappedE), 0, dur)
+      // 短选区两端可能吸到同一采样：放弃吸附而不是让选区静默消失
+      if (e - s < 1 / sr) {
+        s = plainS
+        e = plainE
+      }
     }
     selection.start = s
     selection.end = e
@@ -527,94 +817,6 @@ export const useEditorStore = defineStore('editor', () => {
     )
   }
 
-  // ---- EQ / 压缩（OfflineAudioContext） ----
-  async function applyEffects(settings: EffectSettings, onlySelection: boolean): Promise<void> {
-    const buf = buffer.value
-    if (!buf || busy.type) return
-    const sr = buf.sampleRate
-    const useSel = onlySelection && hasSelection.value
-    const s = useSel ? Math.floor(selection.start * sr) : 0
-    const e = useSel ? Math.floor(selection.end * sr) : buf.length
-    if (e - s < 16) {
-      toast.push('error', '处理区域过短')
-      return
-    }
-    const region = sliceChannels(getAllChannels(buf), s, e)
-    pushHistory()
-    busy.type = 'effects'
-    busy.progress = 10
-    try {
-      const processed = await renderEffects(region, sr, settings)
-      busy.progress = 100
-      let finalChannels = processed
-      if (useSel) {
-        const all = getAllChannels(buf)
-        finalChannels = concatChannels(
-          concatChannels(sliceChannels(all, 0, s), processed),
-          sliceChannels(all, e, buf.length)
-        )
-      }
-      applyChannels(finalChannels, sr)
-      clearSelection()
-      toast.push('success', '效果处理完成')
-    } catch (err) {
-      console.error(err)
-      past.pop()
-      historyVersion.value++
-      toast.push('error', '效果处理失败')
-    } finally {
-      busy.type = null
-      busy.progress = 0
-    }
-  }
-
-  // ---- 门限降噪（Worker） ----
-  async function applyGate(thresholdDb: number, onlySelection: boolean): Promise<void> {
-    const buf = buffer.value
-    if (!buf || busy.type) return
-    const sr = buf.sampleRate
-    const useSel = onlySelection && hasSelection.value
-    const s = useSel ? Math.floor(selection.start * sr) : 0
-    const e = useSel ? Math.floor(selection.end * sr) : buf.length
-    if (e - s < 16) {
-      toast.push('error', '处理区域过短')
-      return
-    }
-    const region = sliceChannels(getAllChannels(buf), s, e)
-    pushHistory()
-    busy.type = 'gate'
-    busy.progress = 0
-    try {
-      const result = await runWorkerTask<{ channels: Float32Array[] }>(
-        getProcessWorker(),
-        { type: 'gate', channels: region, sampleRate: sr, thresholdDb },
-        region.map((c) => c.buffer as ArrayBuffer),
-        (p) => {
-          busy.progress = p
-        }
-      )
-      let finalChannels = result.channels
-      if (useSel) {
-        const all = getAllChannels(buf)
-        finalChannels = concatChannels(
-          concatChannels(sliceChannels(all, 0, s), result.channels),
-          sliceChannels(all, e, buf.length)
-        )
-      }
-      applyChannels(finalChannels, sr)
-      clearSelection()
-      toast.push('success', `门限降噪完成（阈值 ${thresholdDb} dB）`)
-    } catch (err) {
-      console.error(err)
-      past.pop()
-      historyVersion.value++
-      toast.push('error', '门限降噪失败')
-    } finally {
-      busy.type = null
-      busy.progress = 0
-    }
-  }
-
   // ---- 变速（WSOLA Worker） ----
   async function timeStretch(ratio: number, keepPitch: boolean, onlySelection: boolean): Promise<void> {
     const buf = buffer.value
@@ -636,8 +838,7 @@ export const useEditorStore = defineStore('editor', () => {
     busy.progress = 0
     try {
       const region = sliceChannels(getAllChannels(buf), s, e)
-      const result = await runWorkerTask<{ channels: Float32Array[] }>(
-        getProcessWorker(),
+      const result = await runProcessTask<{ channels: Float32Array[] }>(
         { type: 'time-stretch', channels: region, sampleRate: sr, ratio, keepPitch },
         region.map((c) => c.buffer as ArrayBuffer),
         (p) => {
@@ -684,8 +885,7 @@ export const useEditorStore = defineStore('editor', () => {
         }
         normalized.push(ch)
       }
-      const result = await runWorkerTask<{ channels: Float32Array[] }>(
-        getProcessWorker(),
+      const result = await runProcessTask<{ channels: Float32Array[] }>(
         { type: 'merge', clips: normalized, gapSeconds, crossfadeSeconds, sampleRate: targetRate },
         normalized.flat().map((c) => c.buffer as ArrayBuffer),
         (p) => {
@@ -712,26 +912,40 @@ export const useEditorStore = defineStore('editor', () => {
   function undo(): void {
     // 异步处理期间不允许撤销，否则会把半成品写入历史栈
     if (busy.type) return
+    flushChainHistory()
     const snap = past.pop()
     if (!snap) return
-    if (buffer.value) future.push(takeSnapshot())
+    if (snap.kind === 'audio') {
+      future.push(takeSnapshot())
+      applyChannels(snap.channels, snap.sampleRate)
+      restoreChain(snap.chain)
+    } else {
+      future.push(snap)
+      restoreChain(snap.before)
+    }
     trimHistory()
-    applyChannels(snap.channels, snap.sampleRate)
     historyVersion.value++
   }
 
   function redo(): void {
     if (busy.type) return
+    flushChainHistory()
     const snap = future.pop()
     if (!snap) return
-    if (buffer.value) past.push(takeSnapshot())
+    if (snap.kind === 'audio') {
+      past.push(takeSnapshot())
+      applyChannels(snap.channels, snap.sampleRate)
+      restoreChain(snap.chain)
+    } else {
+      past.push(snap)
+      restoreChain(snap.after)
+    }
     trimHistory()
-    applyChannels(snap.channels, snap.sampleRate)
     historyVersion.value++
   }
 
   // ---- 播放控制 ----
-  function togglePlay(): void {
+  function togglePlay(from?: number): void {
     if (!buffer.value) return
     if (audioEngine.isPlaying) {
       audioEngine.pause()
@@ -739,12 +953,19 @@ export const useEditorStore = defineStore('editor', () => {
       return
     }
     syncLoopRange()
-    let from = audioEngine.getPosition()
-    if (from >= duration.value - 0.01) {
-      from = isLooping.value && hasSelection.value ? selection.start : 0
+    let pos = from ?? audioEngine.getPosition()
+    if (pos >= duration.value - 0.01) {
+      pos = isLooping.value && hasSelection.value ? selection.start : 0
     }
-    audioEngine.play(from)
+    audioEngine.play(pos)
     isPlaying.value = true
+  }
+
+  /** 试听：有选区时从选区起点开始，否则从头开始，便于 A/B 对比同一段落 */
+  function audition(): void {
+    if (!buffer.value) return
+    flushChainHistory()
+    togglePlay(hasSelection.value ? selection.start : 0)
   }
 
   function stop(): void {
@@ -782,12 +1003,16 @@ export const useEditorStore = defineStore('editor', () => {
     volume,
     sidebarTab,
     busy,
+    chain,
+    chainActiveNow,
+    activeEffectCount,
     duration,
     hasSelection,
     canUndo,
     canRedo,
     loadFile,
     loadDecodedBuffer,
+    applyViewState,
     setSelection,
     setSelectionRaw,
     clearSelection,
@@ -802,8 +1027,20 @@ export const useEditorStore = defineStore('editor', () => {
     pasteAtPlayhead,
     setGainDb,
     normalize,
-    applyEffects,
-    applyGate,
+    addEffect,
+    removeEffect,
+    moveEffect,
+    setEffectEnabled,
+    updateEffect,
+    setBypass,
+    toggleBypass,
+    previewBypass,
+    setEffectScope,
+    applyPreset,
+    clearChain,
+    loadChain,
+    bounceChain,
+    audition,
     timeStretch,
     mergeClips,
     undo,

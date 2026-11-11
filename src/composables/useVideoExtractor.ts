@@ -2,21 +2,19 @@
  * 视频提取音频（ffmpeg.wasm 单线程核心）。
  *
  * 关键设计：
- *  - 核心文件自托管于 public/ffmpeg，首次按需下载并写入 Cache Storage，
- *    之后从缓存读取，不再重复下载；首屏不加载。
+ *  - 核心加载与实例管理统一交给 utils/ffmpeg-core，与离线音频导出共用同一 Worker；
+ *    任务串行执行，避免两个任务争抢虚拟 FS。
  *  - 输入视频通过 WORKERFS 挂载进虚拟 FS（按需读取 File），
  *    不会把整个视频复制进 MEMFS，避免大文件内存翻倍。
  *  - 解析 ffmpeg 日志中的 time= 计算真实进度。
- *  - 取消通过 terminate 终止 Worker（同时清空其虚拟 FS），下次任务自动重新加载核心。
+ *  - 取消通过终止 Worker（同时清空其虚拟 FS），下次任务自动重新加载核心。
  */
-import { FFmpeg, FFFSType, type LogEvent } from '@ffmpeg/ffmpeg'
-
-const CORE_DIR = `${import.meta.env.BASE_URL}ffmpeg/`
-const CORE_CACHE = 'yac-ffmpeg-core-v1'
-const CORE_FILES: { name: string; type: string; weight: number }[] = [
-  { name: 'ffmpeg-core.js', type: 'text/javascript', weight: 0.05 },
-  { name: 'ffmpeg-core.wasm', type: 'application/wasm', weight: 0.95 }
-]
+import { FFFSType, type LogEvent } from '@ffmpeg/ffmpeg'
+import {
+  FfmpegCancelledError,
+  cancelActiveFfmpegTask,
+  runFfmpegTask
+} from '../utils/ffmpeg-core'
 
 const MOUNT_DIR = '/input'
 const OUTPUT_PATH = '/extract.mp3'
@@ -46,16 +44,6 @@ export interface ExtractResult {
   duration: number
 }
 
-interface CoreUrls {
-  coreURL: string
-  wasmURL: string
-}
-
-let cachedCoreUrls: CoreUrls | null = null
-let coreUrlsPromise: Promise<CoreUrls> | null = null
-let ffmpeg: FFmpeg | null = null
-let coreLoaded = false
-let cancelled = false
 let running = false
 
 /** Windows 非法字符清洗（文件名出口统一走这里） */
@@ -73,105 +61,6 @@ export function sanitizeFileName(name: string): string {
 
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
-}
-
-async function readCachedBlob(url: string): Promise<Blob | null> {
-  if (typeof caches === 'undefined') return null
-  try {
-    const cache = await caches.open(CORE_CACHE)
-    const hit = await cache.match(url)
-    return hit ? await hit.blob() : null
-  } catch {
-    return null
-  }
-}
-
-async function fetchBlobWithProgress(
-  url: string,
-  type: string,
-  onProgress: (p: number) => void
-): Promise<Blob> {
-  const res = await fetch(url)
-  if (!res.ok) throw new Error(`核心文件请求失败（HTTP ${res.status}）`)
-  const total = Number(res.headers.get('content-length') ?? 0)
-  if (!res.body || !(total > 0)) {
-    onProgress(1)
-    return new Blob([await res.arrayBuffer()], { type })
-  }
-  const reader = res.body.getReader()
-  const parts: BlobPart[] = []
-  let received = 0
-  for (;;) {
-    const { done, value } = await reader.read()
-    if (done) break
-    if (value) {
-      parts.push(value)
-      received += value.byteLength
-      onProgress(Math.min(1, received / total))
-    }
-  }
-  return new Blob(parts, { type })
-}
-
-async function ensureCoreUrls(onProgress: (p: number) => void): Promise<CoreUrls> {
-  if (cachedCoreUrls) {
-    onProgress(1)
-    return cachedCoreUrls
-  }
-  if (coreUrlsPromise) return coreUrlsPromise
-
-  coreUrlsPromise = (async () => {
-    let done = 0
-    const objectUrls: string[] = []
-    for (const item of CORE_FILES) {
-      const url = `${CORE_DIR}${item.name}`
-      let blob = await readCachedBlob(url)
-      if (!blob) {
-        blob = await fetchBlobWithProgress(url, item.type, (p) =>
-          onProgress(done + p * item.weight)
-        )
-        try {
-          const cache = await caches.open(CORE_CACHE)
-          await cache.put(url, new Response(blob, { headers: { 'Content-Type': item.type } }))
-        } catch {
-          // Cache Storage 不可用（隐私模式等）时不影响本次使用
-        }
-      } else {
-        onProgress(done + item.weight)
-      }
-      done += item.weight
-      objectUrls.push(URL.createObjectURL(new Blob([blob], { type: item.type })))
-    }
-    onProgress(1)
-    return { coreURL: objectUrls[0], wasmURL: objectUrls[1] }
-  })()
-
-  try {
-    cachedCoreUrls = await coreUrlsPromise
-    return cachedCoreUrls
-  } catch (err) {
-    coreUrlsPromise = null
-    throw new Error(`ffmpeg 核心加载失败：${errorMessage(err)}`)
-  }
-}
-
-async function ensureInstance(onLoadProgress: (p: number) => void): Promise<FFmpeg> {
-  if (ffmpeg && coreLoaded) {
-    onLoadProgress(1)
-    return ffmpeg
-  }
-  const urls = await ensureCoreUrls(onLoadProgress)
-  if (cancelled) throw new Error(CANCEL_MESSAGE)
-  const inst = new FFmpeg()
-  try {
-    await inst.load({ coreURL: urls.coreURL, wasmURL: urls.wasmURL })
-  } catch (err) {
-    inst.terminate()
-    throw new Error(`ffmpeg 核心初始化失败：${errorMessage(err)}`)
-  }
-  ffmpeg = inst
-  coreLoaded = true
-  return inst
 }
 
 function parseLogTime(message: string): number | null {
@@ -224,16 +113,7 @@ function extensionOf(name: string): string {
 
 /** 取消当前任务：终止 Worker（虚拟 FS 随之销毁），下次任务重新加载核心（走缓存） */
 export function cancelExtraction(): void {
-  cancelled = true
-  if (ffmpeg) {
-    try {
-      ffmpeg.terminate()
-    } catch {
-      // 已终止时忽略
-    }
-    ffmpeg = null
-    coreLoaded = false
-  }
+  cancelActiveFfmpegTask()
 }
 
 export async function extractAudio(
@@ -248,104 +128,110 @@ export async function extractAudio(
   }
 
   running = true
-  cancelled = false
-  let inst: FFmpeg | null = null
-  const logs: string[] = []
-  let elapsed = 0
-  let total = Math.max(0, options.durationHint ?? 0)
-
-  const onLog = (e: LogEvent) => {
-    logs.push(e.message)
-    if (logs.length > 600) logs.shift()
-    const t = parseLogTime(e.message)
-    if (t !== null) {
-      elapsed = Math.max(elapsed, t)
-      if (total > 0) {
-        hooks.onProgress(Math.min(0.99, elapsed / total), elapsed, total)
-      }
-    }
-  }
+  hooks.onPhase('loading', '正在加载 ffmpeg 核心…')
 
   try {
-    hooks.onPhase('loading', '正在加载 ffmpeg 核心…')
-    inst = await ensureInstance(hooks.onLoadProgress)
-    if (cancelled) throw new Error(CANCEL_MESSAGE)
-    inst.on('log', onLog)
+    return await runFfmpegTask(async (ctx) => {
+      const logs: string[] = []
+      let elapsed = 0
+      let total = Math.max(0, options.durationHint ?? 0)
 
-    // 1) 挂载输入文件（WORKERFS 不复制视频数据）
-    hooks.onPhase('probing', '正在探测视频音轨…')
-    await inst.createDir(MOUNT_DIR).catch(() => undefined)
-    const inputName = `source${extensionOf(file.name) || '.mp4'}`
-    await inst.mount(
-      FFFSType.WORKERFS,
-      { files: [new File([file], inputName, { type: file.type || 'video/mp4' })] },
-      MOUNT_DIR
-    )
-    const inputPath = `${MOUNT_DIR}/${inputName}`
-
-    // 2) 只探测，不转码：仅 -i 会退出码非 0，但已打印流信息
-    logs.length = 0
-    await inst.exec(['-hide_banner', '-i', inputPath])
-    if (cancelled) throw new Error(CANCEL_MESSAGE)
-
-    const probeText = logs.join('\n')
-    const hasAudio = /Audio:\s/.test(probeText)
-    const probedDuration = parseDuration(probeText)
-    if (probedDuration > 0) total = probedDuration
-    if (!hasAudio) {
-      // 与「格式不支持」区分：能解析出视频/时长，但没有 Audio 流
-      if (/Video:\s/.test(probeText) || probedDuration > 0) {
-        throw new Error('该视频不包含音轨（未检测到 Audio 流），无法提取音频')
+      const onLog = (e: LogEvent) => {
+        logs.push(e.message)
+        if (logs.length > 600) logs.shift()
+        const t = parseLogTime(e.message)
+        if (t !== null) {
+          elapsed = Math.max(elapsed, t)
+          if (total > 0) {
+            hooks.onProgress(Math.min(0.99, elapsed / total), elapsed, total)
+          }
+        }
       }
-      throw new Error(describeFailure(probeText))
-    }
 
-    // 3) 提取为 MP3
-    hooks.onPhase('extracting', '正在提取音频…')
-    elapsed = 0
-    hooks.onProgress(0, 0, total)
-    logs.length = 0
-    const args = ['-i', inputPath, '-vn', '-map', '0:a:0', '-b:a', `${options.bitrate}k`]
-    if (!options.keepOriginalRate) args.push('-ar', '44100')
-    args.push(OUTPUT_PATH)
-    const code = await inst.exec(args)
-    if (cancelled) throw new Error(CANCEL_MESSAGE)
-    if (code !== 0) throw new Error(describeFailure(logs.join('\n')))
+      const inst = ctx.ffmpeg
+      inst.on('log', onLog)
+      try {
+        // 1) 挂载输入文件（WORKERFS 不复制视频数据）
+        hooks.onPhase('probing', '正在探测视频音轨…')
+        await inst.createDir(MOUNT_DIR).catch(() => undefined)
+        const inputName = `source${extensionOf(file.name) || '.mp4'}`
+        await inst.mount(
+          FFFSType.WORKERFS,
+          { files: [new File([file], inputName, { type: file.type || 'video/mp4' })] },
+          MOUNT_DIR
+        )
+        const inputPath = `${MOUNT_DIR}/${inputName}`
 
-    hooks.onProgress(1, total, total)
-    const data = await inst.readFile(OUTPUT_PATH)
-    if (typeof data === 'string') throw new Error('输出文件读取失败')
-    const blob = new Blob([data], { type: 'audio/mpeg' })
-    if (blob.size === 0) throw new Error('提取结果为空，请确认视频音轨有效')
+        // 2) 只探测，不转码：仅 -i 会退出码非 0，但已打印流信息
+        logs.length = 0
+        await inst.exec(['-hide_banner', '-i', inputPath])
+        if (ctx.isCancelled()) throw new FfmpegCancelledError()
 
-    return {
-      blob,
-      fileName: `${sanitizeFileName(file.name)}.mp3`,
-      duration: total
-    }
+        const probeText = logs.join('\n')
+        const hasAudio = /Audio:\s/.test(probeText)
+        const probedDuration = parseDuration(probeText)
+        if (probedDuration > 0) total = probedDuration
+        if (!hasAudio) {
+          // 与「格式不支持」区分：能解析出视频/时长，但没有 Audio 流
+          if (/Video:\s/.test(probeText) || probedDuration > 0) {
+            throw new Error('该视频不包含音轨（未检测到 Audio 流），无法提取音频')
+          }
+          throw new Error(describeFailure(probeText))
+        }
+
+        // 3) 提取为 MP3
+        hooks.onPhase('extracting', '正在提取音频…')
+        elapsed = 0
+        hooks.onProgress(0, 0, total)
+        logs.length = 0
+        const args = ['-i', inputPath, '-vn', '-map', '0:a:0', '-b:a', `${options.bitrate}k`]
+        if (!options.keepOriginalRate) args.push('-ar', '44100')
+        args.push(OUTPUT_PATH)
+        const code = await inst.exec(args)
+        if (ctx.isCancelled()) throw new FfmpegCancelledError()
+        if (code !== 0) throw new Error(describeFailure(logs.join('\n')))
+
+        hooks.onProgress(1, total, total)
+        const data = await inst.readFile(OUTPUT_PATH)
+        if (typeof data === 'string') throw new Error('输出文件读取失败')
+        const blob = new Blob([data], { type: 'audio/mpeg' })
+        if (blob.size === 0) throw new Error('提取结果为空，请确认视频音轨有效')
+
+        return {
+          blob,
+          fileName: `${sanitizeFileName(file.name)}.mp3`,
+          duration: total
+        }
+      } finally {
+        try {
+          inst.off('log', onLog)
+        } catch {
+          // 实例已被终止时忽略
+        }
+        // 正常结束时清理虚拟 FS；取消时 Worker 已终止，FS 已随之销毁
+        if (!ctx.isCancelled()) {
+          try {
+            await inst.unmount(MOUNT_DIR)
+          } catch {
+            // 未挂载时忽略
+          }
+          try {
+            await inst.deleteDir(MOUNT_DIR)
+          } catch {
+            // 目录已不存在时忽略
+          }
+          try {
+            await inst.deleteFile(OUTPUT_PATH)
+          } catch {
+            // 输出文件不存在（失败/取消）时忽略
+          }
+        }
+      }
+    }, hooks.onLoadProgress)
   } catch (err) {
-    if (cancelled) throw new Error(CANCEL_MESSAGE)
+    if (err instanceof FfmpegCancelledError) throw new Error(CANCEL_MESSAGE)
     throw err instanceof Error ? err : new Error(errorMessage(err))
   } finally {
-    if (inst) inst.off('log', onLog)
     running = false
-    // 正常结束时清理虚拟 FS；取消时 Worker 已终止，FS 已随之销毁
-    if (inst && ffmpeg === inst && coreLoaded) {
-      try {
-        await inst.unmount(MOUNT_DIR)
-      } catch {
-        // 未挂载时忽略
-      }
-      try {
-        await inst.deleteDir(MOUNT_DIR)
-      } catch {
-        // 目录已不存在时忽略
-      }
-      try {
-        await inst.deleteFile(OUTPUT_PATH)
-      } catch {
-        // 输出文件不存在（失败/取消）时忽略
-      }
-    }
   }
 }

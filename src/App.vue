@@ -6,10 +6,13 @@ import SidebarTools from './components/SidebarTools.vue'
 import ToastNotification from './components/ToastNotification.vue'
 import { useKeyboardShortcuts } from './composables/useKeyboardShortcuts'
 import { useAudioImporter } from './composables/useAudioImporter'
+import { useProjectPersistence } from './composables/useProjectPersistence'
 
 useKeyboardShortcuts()
 const { dragging, installGlobalDrop } = useAudioImporter()
 installGlobalDrop()
+// 恢复上次的无损音轨与编辑指令，并启动 IndexedDB 自动保存
+useProjectPersistence().install()
 </script>
 
 <template>
