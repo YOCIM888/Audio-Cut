@@ -28,6 +28,8 @@ import {
 } from '../utils/audio-utils'
 import { runWorkerTask } from '../utils/worker-client'
 import { encodeWithFfmpeg, type FfmpegAudioFormat } from './useFfmpegEncoder'
+import { buildMixInputs, mixdown } from '../audio/mixdown'
+import type { MultitrackState } from '../audio/multitrack'
 
 export type ExportFormat = 'wav' | 'mp3' | 'flac' | 'm4a' | 'ogg' | 'webm'
 
@@ -37,7 +39,8 @@ export interface ExportOptions {
   bitDepth: WavBitDepth
   channels: 'keep' | 'mono' | 'stereo'
   bitrate: number
-  range: 'all' | 'selection'
+  /** timeline = 混音全部可听轨；all/selection 仅导出主轨 */
+  range: 'all' | 'selection' | 'timeline'
   fileName: string
   metadata?: TrackMetadata
   /** 16/24-bit WAV 的 TPDF 抖动，默认开启 */
@@ -98,12 +101,86 @@ export function useAudioExporter() {
   const editor = useEditorStore()
   const toast = useToastStore()
 
+  /**
+   * 多轨混音导出：与播放引擎同一套规则（M/S、轨道增益/声像、片段淡变、
+   * 采样率不一致时窗化 sinc 重采样），混完再走原有的效果链与编码链。
+   */
+  async function prepareTimeline(
+    opts: ExportOptions,
+    onProgress: (p: number) => void,
+    onPhase?: (text: string) => void,
+    signal?: AbortSignal
+  ): Promise<{ channels: Float32Array[]; sampleRate: number; chainRendered: boolean }> {
+    const buf = editor.buffer
+    if (!buf) throw new Error('没有可导出的音频')
+    if (!editor.hasMultitrack) throw new Error('当前没有多轨片段，请改用「全曲」')
+    const sr = buf.sampleRate
+    const state: MultitrackState = {
+      tracks: editor.tracks,
+      clips: editor.clips,
+      chainTarget: editor.chainTarget
+    }
+    const fx = editor.chain
+    let chainRendered = false
+    let mainChannels = getAllChannels(buf).map((c) => c.slice())
+
+    // 效果链插在主轨时先渲染主轨，再混音；插在整个混音上时最后渲染总和
+    if (chainActive(fx) && state.chainTarget === 'main') {
+      onPhase?.('正在离线渲染主轨效果链…')
+      mainChannels = await renderChain(
+        mainChannels,
+        sr,
+        enabledNodes(fx),
+        (p) => onProgress(0.02 + (p / 100) * 0.24),
+        signal
+      )
+      chainRendered = true
+    }
+
+    onPhase?.('正在离线混音…')
+    const inputs = buildMixInputs(
+      { channels: mainChannels, sampleRate: sr, duration: buf.duration },
+      state,
+      true
+    )
+    let channels = mixdown(inputs, {
+      sampleRate: sr,
+      outChannels: opts.channels === 'mono' ? 1 : 2,
+      duration: editor.timelineLength,
+      onProgress: (p) => onProgress(0.27 + p * 0.13),
+      signal
+    })
+
+    if (chainActive(fx) && state.chainTarget === 'mix') {
+      onPhase?.('正在离线渲染整轨效果链…')
+      channels = await renderChain(
+        channels,
+        sr,
+        enabledNodes(fx),
+        (p) => onProgress(0.4 + (p / 100) * 0.2),
+        signal
+      )
+      chainRendered = true
+    }
+
+    throwIfAborted(signal)
+    channels = convertChannels(channels, opts.channels === 'keep' ? 'keep' : opts.channels)
+    let outRate = sr
+    if (opts.sampleRate && opts.sampleRate !== sr) {
+      channels = await withAbort(resampleChannels(channels, sr, opts.sampleRate), signal)
+      outRate = opts.sampleRate
+    }
+    throwIfAborted(signal)
+    return { channels, sampleRate: outRate, chainRendered }
+  }
+
   async function prepare(
     opts: ExportOptions,
     onProgress: (p: number) => void,
     onPhase?: (text: string) => void,
     signal?: AbortSignal
   ): Promise<{ channels: Float32Array[]; sampleRate: number; chainRendered: boolean }> {
+    if (opts.range === 'timeline') return prepareTimeline(opts, onProgress, onPhase, signal)
     const buf = editor.buffer
     if (!buf) throw new Error('没有可导出的音频')
     throwIfAborted(signal)

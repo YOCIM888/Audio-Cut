@@ -23,14 +23,19 @@ import {
   isPersistenceAvailable,
   persistenceUnavailableReason,
   readAudio,
+  readClips,
   readSession,
   readSource,
   writeAudio,
+  writeClips,
   writeSession,
   writeSource,
   type AudioRecord,
+  type ClipAudioEntry,
   type SessionMeta
 } from '../utils/project-db'
+import { decodeWavBlob, encodeFloatWavBlob } from '../utils/wav-blob'
+import { clipFileName } from '../audio/multitrack'
 import { getSourceFile, onSourceFileChange, setSourceFile } from '../utils/source-file'
 
 /** 超过此体积不再自动落盘（约 45 分钟 48kHz 立体声），避免拖垮浏览器与磁盘配额 */
@@ -68,8 +73,9 @@ const statusLabel = computed(() => {
 
 const statusTitle = computed(() => {
   const size = storedBytes.value > 0 ? `${(storedBytes.value / 1024 / 1024).toFixed(1)} MB 无损音轨` : '未写入音轨'
+  const extra = clipBytes > 0 ? `\n${(clipBytes / 1024 / 1024).toFixed(1)} MB 多轨片段` : ''
   const reason = note.value ? `\n${note.value}` : ''
-  return `工程自动保存在本浏览器的 IndexedDB 中，刷新或关闭页面后可自动恢复。\n${size}${reason}`
+  return `工程自动保存在本浏览器的 IndexedDB 中，刷新或关闭页面后可自动恢复。\n${size}${extra}${reason}`
 })
 
 function formatBytes(n: number): string {
@@ -80,7 +86,12 @@ let installed = false
 let suppress = false
 let metaTimer: number | null = null
 let audioTimer: number | null = null
+let clipTimer: number | null = null
 let audioDirty = false
+let clipDirty = false
+/** 片段采样不可变：只有 id / 采样率 / 长度变化才需要重写 WAV Blob */
+let lastClipSignature = ''
+let clipBytes = 0
 let queue: Promise<void> = Promise.resolve()
 let lastAudioKey = 0
 let warnedOversize = false
@@ -116,8 +127,38 @@ export function useProjectPersistence() {
       audioKey,
       audioBytes,
       audioOversize: oversize,
-      sourceName: src?.name ?? null
+      sourceName: src?.name ?? null,
+      multitrack: editor.hasMultitrack ? editor.serializeMultitrack() : null,
+      mainView: editor.mainView
     }
+  }
+
+  function currentClipSignature(): string {
+    return editor.clips
+      .map((c) => `${c.id}:${c.channels.length}:${c.channels[0]?.length ?? 0}:${c.sampleRate}`)
+      .join('|')
+  }
+
+  /** 片段 PCM 单独落盘：参数拖动只改 session meta，不会重写几十 MB 的 WAV */
+  async function writeClipSnapshot(): Promise<void> {
+    const sig = currentClipSignature()
+    if (sig === lastClipSignature) return
+    const entries: ClipAudioEntry[] = []
+    let bytes = 0
+    for (const clip of editor.clips) {
+      const blob = await encodeFloatWavBlob(clip.channels, clip.sampleRate)
+      entries.push({ file: clipFileName(clip.id), blob })
+      bytes += blob.size
+    }
+    if (bytes > MAX_AUTOSAVE_BYTES) {
+      note.value = `多轨片段共 ${formatBytes(bytes)}，超过自动保存上限，请用「保存工程」导出 .yac.zip`
+      status.value = 'oversize'
+      return
+    }
+    const ok = await writeClips({ id: ACTIVE_ID, updatedAt: Date.now(), entries, bytes })
+    if (!ok) throw new Error('多轨片段写入失败')
+    lastClipSignature = sig
+    clipBytes = bytes
   }
 
   /** 所有 IDB 写入串行执行；失败不抛出到 UI，只降级状态并提示一次 */
@@ -216,6 +257,25 @@ export function useProjectPersistence() {
     }, 1000)
   }
 
+  function flushClips(): Promise<void> {
+    if (!clipDirty || paused.value) return Promise.resolve()
+    clipDirty = false
+    if (clipTimer !== null) {
+      window.clearTimeout(clipTimer)
+      clipTimer = null
+    }
+    return enqueue(writeClipSnapshot)
+  }
+
+  function scheduleClips(): void {
+    clipDirty = true
+    if (clipTimer !== null) window.clearTimeout(clipTimer)
+    clipTimer = window.setTimeout(() => {
+      clipTimer = null
+      void flushClips()
+    }, 1500)
+  }
+
   function scheduleMeta(): void {
     if (metaTimer !== null) window.clearTimeout(metaTimer)
     metaTimer = window.setTimeout(() => {
@@ -286,8 +346,31 @@ export function useProjectPersistence() {
         snapGrid: meta.snapGrid,
         viewMode: meta.viewMode,
         markers: meta.markers,
-        noiseProfile: meta.noiseProfile
+        noiseProfile: meta.noiseProfile,
+        mainView: meta.mainView
       })
+      // 多轨片段：每份 32-bit float WAV 解码回 planar Float32Array
+      const clipRecord = await readClips()
+      const clipAudio = new Map<string, { channels: Float32Array[]; sampleRate: number }>()
+      if (clipRecord) {
+        for (const entry of clipRecord.entries) {
+          try {
+            const decoded = await decodeWavBlob(entry.blob)
+            clipAudio.set(entry.file, { channels: decoded.channels, sampleRate: decoded.sampleRate })
+          } catch (err) {
+            console.warn('[autosave] 片段解码失败', entry.file, err)
+          }
+        }
+        clipBytes = clipRecord.bytes
+      }
+      const mt = meta.multitrack
+      const clipCount = editor.loadMultitrack(
+        mt?.tracks ?? null,
+        mt?.clips ?? [],
+        clipAudio,
+        mt?.chainTarget ?? 'main'
+      )
+      lastClipSignature = currentClipSignature()
       const src = await readSource()
       setSourceFile(src ? { blob: src.blob, name: src.name } : null, false)
       await nextTick()
@@ -309,7 +392,7 @@ export function useProjectPersistence() {
           : ''
       toast.push(
         stale || meta.audioOversize ? 'info' : 'success',
-        `已恢复上次编辑：${meta.name}（无损音轨 ${formatBytes(audio.bytes)}，效果链 ${nodeCount} 个节点）${warning}`,
+        `已恢复上次编辑：${meta.name}（无损音轨 ${formatBytes(audio.bytes)}，效果链 ${nodeCount} 个节点${clipCount ? `，多轨 ${clipCount} 个片段` : ''}）${warning}`,
         6500
       )
       return true
@@ -335,7 +418,9 @@ export function useProjectPersistence() {
     }
     paused.value = false
     audioDirty = true
+    clipDirty = true
     await flushAudio()
+    await flushClips()
     if (status.value === 'saved') toast.push('success', '本地工程已保存')
     else if (status.value === 'oversize') {
       toast.push('info', `${note.value}，请改用「保存工程」导出 .yac.zip 归档`, 6500)
@@ -346,9 +431,14 @@ export function useProjectPersistence() {
   async function deleteLocalProject(): Promise<void> {
     if (metaTimer !== null) window.clearTimeout(metaTimer)
     if (audioTimer !== null) window.clearTimeout(audioTimer)
+    if (clipTimer !== null) window.clearTimeout(clipTimer)
     metaTimer = null
     audioTimer = null
+    clipTimer = null
     audioDirty = false
+    clipDirty = false
+    lastClipSignature = ''
+    clipBytes = 0
     paused.value = true
     await enqueue(async () => {
       await clearSession()
@@ -404,7 +494,11 @@ export function useProjectPersistence() {
         editor.markers,
         editor.snapGrid,
         editor.viewMode,
-        editor.noiseProfile
+        editor.noiseProfile,
+        editor.tracks,
+        editor.clips,
+        editor.chainTarget,
+        editor.mainView
       ],
       () => {
         if (!suppress && !paused.value && status.value !== 'disabled') scheduleMeta()
@@ -425,14 +519,25 @@ export function useProjectPersistence() {
       { flush: 'post' }
     )
 
+    // 片段采样集合变化时单独落盘；参数拖动只改 session meta
+    watch(
+      () => editor.clips,
+      () => {
+        if (!suppress && !paused.value && status.value !== 'disabled') scheduleClips()
+      },
+      { flush: 'post' }
+    )
+
     window.addEventListener('pagehide', () => {
       flushMeta()
       void flushAudio()
+      void flushClips()
     })
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState !== 'hidden') return
       flushMeta()
       void flushAudio()
+      void flushClips()
     })
 
     void restore()

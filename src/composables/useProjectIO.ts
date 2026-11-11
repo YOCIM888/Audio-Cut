@@ -18,14 +18,15 @@ import { audioEngine } from '../audio/engine'
 import { cloneChain, sanitizeChain, type EffectChainState } from '../audio/effect-chain'
 import type { Marker } from '../audio/markers'
 import type { NoiseProfile } from '../audio/spectral'
+import { clipFileName, type SerializedMultitrack } from '../audio/multitrack'
 import { channelsToAudioBuffer, getAllChannels } from '../utils/audio-utils'
 import { decodeWavBlob, encodeFloatWavBlob } from '../utils/wav-blob'
 import { createZip, readZip, type ZipInput } from '../utils/zip'
 import { clearSourceFile, getSourceFile, setSourceFile } from '../utils/source-file'
 
 const PROJECT_APP = 'yocim-audio-cut'
-/** v4 起工程包额外保存标记点、吸附精度、频谱视图模式与噪声指纹 */
-const PROJECT_VERSION = 4
+/** v5 起工程包额外保存多轨片段（每片段一份无损 WAV）与主视图模式 */
+const PROJECT_VERSION = 5
 const AUDIO_ENTRY = 'audio.wav'
 const MANIFEST_ENTRY = 'project.json'
 
@@ -49,6 +50,9 @@ interface ProjectManifest {
   snapGrid: number
   viewMode: 'waveform' | 'spectrum' | 'both'
   noiseProfile: NoiseProfile | null
+  /** v5：多轨元信息；片段音频放在 tracks/clip-*.wav */
+  multitrack: SerializedMultitrack | null
+  mainView: 'waveform' | 'timeline'
   audio: { file: string; encoding: 'wav-f32' }
   source: { file: string; name: string; bytes: number } | null
 }
@@ -131,6 +135,16 @@ export function useProjectIO() {
       })
       const src = getSourceFile()
       const sourceEntry = src ? `source/${safeName(src.name)}` : null
+      const mt = editor.hasMultitrack ? editor.serializeMultitrack() : null
+      const clipEntries: ZipInput[] = []
+      if (mt) {
+        for (let i = 0; i < editor.clips.length; i++) {
+          const clip = editor.clips[i]
+          const wav = await encodeFloatWavBlob(clip.channels, clip.sampleRate)
+          clipEntries.push({ name: clipFileName(clip.id), data: wav })
+          progress.value = 0.6 + (0.15 * (i + 1)) / editor.clips.length
+        }
+      }
       const manifest: ProjectManifest = {
         version: PROJECT_VERSION,
         app: PROJECT_APP,
@@ -151,23 +165,26 @@ export function useProjectIO() {
         snapGrid: editor.snapGrid,
         viewMode: editor.viewMode,
         noiseProfile: editor.noiseProfile,
+        multitrack: mt,
+        mainView: editor.mainView,
         audio: { file: AUDIO_ENTRY, encoding: 'wav-f32' },
         source: src && sourceEntry ? { file: sourceEntry, name: src.name, bytes: src.blob.size } : null
       }
 
       const entries: ZipInput[] = [
         { name: MANIFEST_ENTRY, data: JSON.stringify(manifest, null, 2) },
-        { name: AUDIO_ENTRY, data: wav }
+        { name: AUDIO_ENTRY, data: wav },
+        ...clipEntries
       ]
       if (src && sourceEntry) entries.push({ name: sourceEntry, data: src.blob })
-      progress.value = 0.7
+      progress.value = 0.85
       const zip = await createZip(entries)
       progress.value = 1
 
       download(zip, `${stem(editor.fileName ?? 'project')}.yac.zip`)
       toast.push(
         'success',
-        `工程包已导出（${formatBytes(zip.size)}）：project.json 只含编辑指令，音轨为 32-bit float 无损 WAV${src ? '，并附原始导入文件' : ''}`,
+        `工程包已导出（${formatBytes(zip.size)}）：project.json 只含编辑指令，音轨为 32-bit float 无损 WAV${mt ? `，另含 ${clipEntries.length} 个无损多轨片段` : ''}${src ? '，并附原始导入文件' : ''}`,
         6000
       )
     } catch (err) {
@@ -211,8 +228,37 @@ export function useProjectIO() {
       snapGrid: data.snapGrid,
       viewMode: data.viewMode,
       markers: data.markers,
-      noiseProfile: data.noiseProfile
+      noiseProfile: data.noiseProfile,
+      mainView: data.mainView
     })
+
+    // v5：逐片段解码无损 WAV，再按元信息重建轨道与位置
+    let restoredClips = 0
+    if (data.multitrack?.clips?.length) {
+      const audio = new Map<string, { channels: Float32Array[]; sampleRate: number }>()
+      for (const meta of data.multitrack.clips) {
+        const blob = findEntry(entries, meta.file)
+        if (!blob) continue
+        try {
+          const decoded = await decodeWavBlob(blob)
+          audio.set(meta.file, { channels: decoded.channels, sampleRate: decoded.sampleRate })
+        } catch (err) {
+          console.warn('[project] 片段解码失败', meta.file, err)
+        }
+      }
+      restoredClips = editor.loadMultitrack(
+        data.multitrack.tracks,
+        data.multitrack.clips,
+        audio,
+        data.multitrack.chainTarget
+      )
+      if (restoredClips < data.multitrack.clips.length) {
+        toast.push('info', `有 ${data.multitrack.clips.length - restoredClips} 个片段数据缺失，已跳过`, 6000)
+      }
+    } else {
+      // 旧版工程没有多轨：清掉当前会话残留的片段，避免混入上一个工程
+      editor.loadMultitrack(null, [], new Map(), 'main')
+    }
 
     const srcEntry = data.source?.file ? findEntry(entries, data.source.file) : undefined
     setSourceFile(
@@ -221,7 +267,7 @@ export function useProjectIO() {
     const nodeCount = chain?.nodes.length ?? 0
     toast.push(
       'success',
-      `工程已恢复：${formatBytes(audioBlob.size)} 无损音轨、效果链 ${nodeCount} 个节点${srcEntry ? '、原始导入文件' : ''}`,
+      `工程已恢复：${formatBytes(audioBlob.size)} 无损音轨、效果链 ${nodeCount} 个节点${restoredClips ? `、多轨 ${restoredClips} 个片段` : ''}${srcEntry ? '、原始导入文件' : ''}`,
       5500
     )
   }

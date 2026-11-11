@@ -10,22 +10,24 @@ import AnalysisPanel from './AnalysisPanel.vue'
 import MarkersPanel from './MarkersPanel.vue'
 import RepairPanel from './RepairPanel.vue'
 import BatchPanel from './BatchPanel.vue'
+import MultitrackPanel from './MultitrackPanel.vue'
 
 const editor = useEditorStore()
 
-/** 两行分组：第一行是基础剪辑，第二行是测量 / 导航 / 修复 / 自动化 */
+/** 两行分组：第一行是编辑 / 测量 / 多轨，第二行是素材处理与输出 */
 const tabRows: { key: SidebarTab; label: string; title: string }[][] = [
   [
     { key: 'edit', label: '编辑', title: '剪切、复制、粘贴、淡变' },
     { key: 'effects', label: '效果链', title: '非破坏性多段 EQ 与动态效果' },
-    { key: 'speed', label: '变速', title: 'WSOLA 变速 / 保持音调' },
-    { key: 'merge', label: '合并', title: '多段音频拼接' },
-    { key: 'extract', label: '提取', title: '从视频中提取音频' }
-  ],
-  [
     { key: 'measure', label: '测量', title: 'LUFS / RMS / 真峰值 / 频谱图' },
     { key: 'marks', label: '标记', title: 'Cue 列表、吸附精度、静音分段' },
     { key: 'repair', label: '修复', title: '降噪 / 去咔嗒 / 限制器 / 变调' },
+    { key: 'tracks', label: '多轨', title: '多轨时间线、麦克风录音、片段管理' }
+  ],
+  [
+    { key: 'speed', label: '变速', title: 'WSOLA 变速 / 保持音调' },
+    { key: 'merge', label: '合并', title: '多段音频拼接' },
+    { key: 'extract', label: '提取', title: '从视频中提取音频' },
     { key: 'batch', label: '批量', title: '多文件串行处理与批量导出' },
     { key: 'export', label: '导出', title: 'WAV / MP3 / FLAC / M4A / OGG / WebM' }
   ]
@@ -43,7 +45,7 @@ async function applyStretch(): Promise<void> {
 
 <template>
   <aside class="w-80 shrink-0 border-l border-neon/15 bg-abyss-900/70 backdrop-blur flex flex-col">
-    <nav class="grid grid-cols-5 border-b border-neon/15">
+    <nav class="grid grid-cols-6 border-b border-neon/15">
       <button
         v-for="tab in tabRows.flat()"
         :key="tab.key"
@@ -128,6 +130,8 @@ async function applyStretch(): Promise<void> {
       <RepairPanel v-else-if="editor.sidebarTab === 'repair'" />
 
       <BatchPanel v-else-if="editor.sidebarTab === 'batch'" />
+
+      <MultitrackPanel v-else-if="editor.sidebarTab === 'tracks'" />
 
       <ExportPanel v-else-if="editor.sidebarTab === 'export'" />
     </div>

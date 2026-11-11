@@ -13,15 +13,19 @@
 import type { EffectChainState } from '../audio/effect-chain'
 import type { Marker } from '../audio/markers'
 import type { NoiseProfile } from '../audio/spectral'
+import type { SerializedMultitrack } from '../audio/multitrack'
 
 export const ACTIVE_ID = 'active'
-export const SESSION_VERSION = 4
+/** v5 起额外保存多轨片段与视图模式 */
+export const SESSION_VERSION = 5
 
 const DB_NAME = 'yocim-audio-cut'
-const DB_VERSION = 1
+/** v2 新增 clips store：每个片段一份 32-bit float WAV Blob */
+const DB_VERSION = 2
 const STORE_SESSION = 'session'
 const STORE_AUDIO = 'audio'
 const STORE_SOURCE = 'source'
+const STORE_CLIPS = 'clips'
 
 export interface SessionMeta {
   id: typeof ACTIVE_ID
@@ -50,6 +54,23 @@ export interface SessionMeta {
   /** 音频超出自动保存上限时仍保存指令，但明确标记音轨未落盘 */
   audioOversize: boolean
   sourceName: string | null
+  /** 多轨元信息（轨道、片段位置与参数），采样字节在 clips store 里 */
+  multitrack: SerializedMultitrack | null
+  mainView: 'waveform' | 'timeline'
+}
+
+export interface ClipAudioEntry {
+  /** 与 ClipMeta.file 对应 */
+  file: string
+  blob: Blob
+}
+
+/** 所有片段的无损 PCM，一条记录；与 session 分开写，避免频繁改参数时重写大 Blob */
+export interface ClipRecord {
+  id: typeof ACTIVE_ID
+  updatedAt: number
+  entries: ClipAudioEntry[]
+  bytes: number
 }
 
 /** planar Float32：blob 内依次为 ch0/ch1/...，每段 length * 4 字节 */
@@ -99,6 +120,7 @@ function openDB(): Promise<IDBDatabase | null> {
       if (!db.objectStoreNames.contains(STORE_SESSION)) db.createObjectStore(STORE_SESSION, { keyPath: 'id' })
       if (!db.objectStoreNames.contains(STORE_AUDIO)) db.createObjectStore(STORE_AUDIO, { keyPath: 'id' })
       if (!db.objectStoreNames.contains(STORE_SOURCE)) db.createObjectStore(STORE_SOURCE, { keyPath: 'id' })
+      if (!db.objectStoreNames.contains(STORE_CLIPS)) db.createObjectStore(STORE_CLIPS, { keyPath: 'id' })
     }
     req.onsuccess = () => {
       const db = req.result
@@ -200,8 +222,18 @@ export function deleteSource(): Promise<boolean> {
   return del(STORE_SOURCE)
 }
 
+export async function readClips(): Promise<ClipRecord | null> {
+  const row = await get<ClipRecord>(STORE_CLIPS)
+  if (!row || !Array.isArray(row.entries)) return null
+  return row
+}
+
+export function writeClips(rec: ClipRecord): Promise<boolean> {
+  return put(STORE_CLIPS, rec)
+}
+
 export async function clearSession(): Promise<void> {
-  await Promise.all([del(STORE_SESSION), del(STORE_AUDIO), del(STORE_SOURCE)])
+  await Promise.all([del(STORE_SESSION), del(STORE_AUDIO), del(STORE_SOURCE), del(STORE_CLIPS)])
 }
 
 export async function isPersistenceAvailable(): Promise<boolean> {

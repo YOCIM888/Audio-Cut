@@ -3,16 +3,40 @@
  * AudioBuffer 与播放头时间均不进入 Vue 响应式系统，
  * 波形组件通过 rAF 直读 getPosition() 绘制播放头。
  *
- * 效果链为非破坏性试听：source 同时馈入干路（原始）与湿路（效果节点图），
+ * 效果链为非破坏性试听：主轨源同时馈入干路（原始）与湿路（效果节点图），
  * A/B 旁路只切换两个增益，链参数变化时只更新 AudioParam。
+ *
+ * 多轨：主轨仍是 editor.buffer，其它轨道由若干 Clip 组成。每个 clip 独立
+ * AudioBufferSourceNode → Gain（增益 / 淡变）→ StereoPanner → 汇流母线，
+ * 按时间轴 start 提前或延后调度，因此不需要预先混音，拖动片段后立即生效。
+ * 循环与结束判定统一交给 25ms 看门狗，让所有轨道共享同一条时间线。
  */
 import { chainActive, enabledNodes, type EffectChainState } from './effect-chain'
 import { EffectGraph, ensureGateWorklet } from './effect-graph'
 import { createRealtimeMeter, type MeterHandle, type MeterMode, type MeterStats } from './meter'
+import { channelsToAudioBuffer } from '../utils/audio-utils'
+import type { ChainTarget, ScheduledClip } from './multitrack'
 
 export interface LoopRange {
   start: number
   end: number
+}
+
+export interface TimelineSetup {
+  clips: ScheduledClip[]
+  /** 整条时间线时长（秒） */
+  duration: number
+  chainTarget: ChainTarget
+  /** 主轨增益（线性）与声像 */
+  mainGain: number
+  mainPan: number
+}
+
+interface ClipNode {
+  id: string
+  source: AudioBufferSourceNode
+  gain: GainNode
+  panner: StereoPannerNode | null
 }
 
 class AudioEngine {
@@ -23,6 +47,11 @@ class AudioEngine {
   private fxInput: GainNode | null = null
   private meterTap: GainNode | null = null
   private graph: EffectGraph | null = null
+  /** 主轨输入（承载轨道增益 / 声像），永远接到干路与湿路 */
+  private mainInput: GainNode | null = null
+  private mainPanner: StereoPannerNode | null = null
+  /** 其它轨道的汇流母线：chainTarget=main 时绕过效果链，mix 时改走干湿路 */
+  private clipBus: GainNode | null = null
   private source: AudioBufferSourceNode | null = null
   private buffer: AudioBuffer | null = null
   private startedAt = 0
@@ -42,6 +71,19 @@ class AudioEngine {
   private meterHandle: MeterHandle | null = null
   private meterMode: MeterMode = 'unavailable'
   private meterAttaching = false
+
+  // ---- 多轨 ----
+  private timeline: TimelineSetup = {
+    clips: [],
+    duration: 0,
+    chainTarget: 'main',
+    mainGain: 1,
+    mainPan: 0
+  }
+  private clipNodes: ClipNode[] = []
+  /** 按 clip id 缓存 AudioBuffer；片段采样不可变，剪切只改 offset/duration */
+  private clipBuffers = new Map<string, AudioBuffer>()
+  private tickTimer: number | null = null
 
   /** 自然播放结束回调（手动 stop 不触发） */
   onEnded: (() => void) | null = null
@@ -72,6 +114,24 @@ class AudioEngine {
       this.dryGain.connect(this.meterTap)
       this.wetGain.connect(this.meterTap)
 
+      this.mainInput = ctx.createGain()
+      this.mainInput.gain.value = this.timeline.mainGain
+      this.mainPanner = this.createPanner(ctx)
+      if (this.mainPanner) {
+        this.mainPanner.pan.value = this.timeline.mainPan
+        this.mainInput.connect(this.mainPanner)
+        this.mainPanner.connect(this.dryGain)
+        this.mainPanner.connect(this.fxInput)
+      } else {
+        this.mainInput.connect(this.dryGain)
+        this.mainInput.connect(this.fxInput)
+      }
+
+      this.clipBus = ctx.createGain()
+      this.clipBus.gain.value = 1
+      this.clipBus.connect(this.gainNode)
+      this.clipBus.connect(this.meterTap)
+
       this.graph = new EffectGraph(ctx, this.fxInput, this.wetGain)
       this.graph.sync(this.effectState ? enabledNodes(this.effectState) : [])
       this.prepareGateWorklet()
@@ -82,12 +142,24 @@ class AudioEngine {
     return this.ctx
   }
 
+  private createPanner(ctx: AudioContext): StereoPannerNode | null {
+    return typeof ctx.createStereoPanner === 'function' ? ctx.createStereoPanner() : null
+  }
+
   get isPlaying(): boolean {
     return this.playing
   }
 
   get duration(): number {
-    return this.buffer?.duration ?? 0
+    return this.timelineDuration
+  }
+
+  private get timelineDuration(): number {
+    return Math.max(this.buffer?.duration ?? 0, this.timeline.duration)
+  }
+
+  get hasClips(): boolean {
+    return this.timeline.clips.length > 0
   }
 
   /** 订阅实时电平表；第一个订阅者会惰性创建 AudioWorklet，最后一个解除时释放 */
@@ -135,8 +207,27 @@ class AudioEngine {
     }
   }
 
+  /**
+   * 由 store 的 watcher 调用：更新多轨布局。
+   * restart=false 用于时间线拖动预览，避免每帧重建所有 source；
+   * 拖动结束后 store 调一次 seek 重新调度即可。
+   */
+  setTimeline(setup: TimelineSetup, restart = true): void {
+    this.timeline = setup
+    const keep = new Set(setup.clips.map((c) => c.id))
+    for (const id of this.clipBuffers.keys()) {
+      if (!keep.has(id)) this.clipBuffers.delete(id)
+    }
+    if (this.ctx) {
+      if (this.mainInput) this.mainInput.gain.value = setup.mainGain
+      if (this.mainPanner) this.mainPanner.pan.value = setup.mainPan
+    }
+    if (restart && this.playing) this.play(this.getPosition())
+    // restart=false 时保留当前已排程的片段，拖动结束后由 store 调 seek 重新调度
+  }
+
   setBuffer(buffer: AudioBuffer | null): void {
-    this.stopSource()
+    this.stopAllSources()
     this.buffer = buffer
     this.playing = false
     this.startOffset = 0
@@ -205,60 +296,143 @@ class AudioEngine {
     }
   }
 
-  play(from?: number): void {
-    if (!this.buffer) return
-    const ctx = this.ensureContext()
-    this.stopSource()
+  private clipBuffer(clip: ScheduledClip): AudioBuffer {
+    const cached = this.clipBuffers.get(clip.id)
+    if (cached) return cached
+    const buffer = channelsToAudioBuffer(clip.channels, clip.sampleRate)
+    this.clipBuffers.set(clip.id, buffer)
+    return buffer
+  }
 
-    const dur = this.buffer.duration
-    let offset = Math.min(Math.max(0, from ?? this.startOffset), Math.max(0, dur - 0.001))
+  /** 为所有未来会响的片段提前排程；起播点之前的片段跳过，中途的自动偏移 */
+  private scheduleClips(ctx: AudioContext, pos: number, when: number): void {
+    const viaChain = this.timeline.chainTarget === 'mix'
+    const dry = this.dryGain!
+    const fx = this.fxInput!
+    const bus = this.clipBus!
+    for (const clip of this.timeline.clips) {
+      if (clip.start + clip.duration <= pos) continue
+      const buffer = this.clipBuffer(clip)
+      const delay = Math.max(0, clip.start - pos)
+      const skip = Math.max(0, pos - clip.start)
+      const srcOffset = Math.min(Math.max(0, clip.offset + skip), Math.max(0, buffer.duration - 0.001))
+      const remain = Math.min(clip.duration - skip, Math.max(0, buffer.duration - srcOffset))
+      if (remain <= 0.001) continue
 
-    const src = ctx.createBufferSource()
-    src.buffer = this.buffer
-    src.connect(this.dryGain!)
-    src.connect(this.fxInput!)
-
-    // 仅循环模式下才把选区当作循环边界；普通播放不受选区限制
-    if (this.loop) {
-      src.loop = true
-      if (this.range) {
-        if (offset < this.range.start || offset >= this.range.end) offset = this.range.start
-        src.loopStart = this.range.start
-        src.loopEnd = this.range.end
-      } else {
-        src.loopStart = 0
-        src.loopEnd = dur
+      const src = ctx.createBufferSource()
+      src.buffer = buffer
+      const gain = ctx.createGain()
+      const panner = this.createPanner(ctx)
+      src.connect(gain)
+      let tail: AudioNode = gain
+      if (panner) {
+        gain.connect(panner)
+        panner.pan.value = clip.pan
+        tail = panner
       }
-    }
+      if (viaChain) {
+        tail.connect(dry)
+        tail.connect(fx)
+      } else {
+        tail.connect(bus)
+      }
 
-    src.onended = () => {
-      if (this.source !== src) return
-      this.source = null
-      this.playing = false
-      this.startOffset = 0
-      this.syncMixTimer()
-      this.onEnded?.()
+      const t0 = when + delay
+      const fi = Math.min(Math.max(0, clip.fadeInMs / 1000), remain / 2)
+      const fo = Math.min(Math.max(0, clip.fadeOutMs / 1000), remain / 2)
+      gain.gain.setValueAtTime(fi > 0 ? 0 : clip.gain, t0)
+      if (fi > 0) gain.gain.linearRampToValueAtTime(clip.gain, t0 + fi)
+      if (fo > 0) {
+        gain.gain.setValueAtTime(clip.gain, t0 + remain - fo)
+        gain.gain.linearRampToValueAtTime(0, t0 + remain)
+      } else {
+        gain.gain.setValueAtTime(clip.gain, t0 + remain)
+      }
+      try {
+        src.start(t0, srcOffset, remain)
+      } catch {
+        continue
+      }
+      this.clipNodes.push({ id: clip.id, source: src, gain, panner })
     }
+  }
 
-    this.source = src
-    this.startedAt = ctx.currentTime
+  play(from?: number): void {
+    if (!this.buffer && this.timeline.clips.length === 0) return
+    const ctx = this.ensureContext()
+    this.stopAllSources()
+    const total = this.timelineDuration
+    if (total <= 0) return
+    let offset = Math.min(Math.max(0, from ?? this.startOffset), Math.max(0, total - 0.001))
+    const ls = this.loop ? (this.range?.start ?? 0) : 0
+    const le = this.loop ? (this.range?.end ?? total) : total
+    if (this.loop && (offset < ls || offset >= le)) offset = ls
+
+    // 15ms 预排，避开主线程抖动造成的开头爆音
+    const when = ctx.currentTime + 0.015
+    if (this.buffer && offset < this.buffer.duration - 0.001) {
+      const src = ctx.createBufferSource()
+      src.buffer = this.buffer
+      src.connect(this.mainInput!)
+      src.start(when, offset)
+      this.source = src
+    }
+    this.scheduleClips(ctx, offset, when)
+
+    this.startedAt = when
     this.startOffset = offset
     this.playing = true
     this.applyMix()
     this.syncMixTimer()
-    src.start(0, offset)
+    this.startTick()
+  }
+
+  /** 循环 / 结束统一由看门狗判定，所有轨道共享同一播放头 */
+  private startTick(): void {
+    this.stopTick()
+    this.tickTimer = window.setInterval(() => this.tick(), 25)
+  }
+
+  private stopTick(): void {
+    if (this.tickTimer !== null) {
+      window.clearInterval(this.tickTimer)
+      this.tickTimer = null
+    }
+  }
+
+  private tick(): void {
+    if (!this.playing || !this.ctx) return
+    const ctxTime = this.ctx.currentTime
+    if (ctxTime < this.startedAt) return
+    const total = this.timelineDuration
+    const ls = this.range?.start ?? 0
+    const le = this.range?.end ?? total
+    const p = this.getPosition()
+    if (this.loop && le > ls) {
+      if (p >= le - 0.02) this.play(ls)
+      return
+    }
+    if (p >= total - 0.02) {
+      this.stopAllSources()
+      this.playing = false
+      this.startOffset = 0
+      this.stopTick()
+      this.syncMixTimer()
+      this.applyMix()
+      this.onEnded?.()
+    }
   }
 
   pause(): void {
     if (!this.playing) return
     this.startOffset = this.getPosition()
-    this.stopSource()
+    this.stopAllSources()
     this.playing = false
     this.syncMixTimer()
   }
 
   stop(): void {
-    this.stopSource()
+    this.stopAllSources()
     this.playing = false
     this.startOffset = 0
     this.syncMixTimer()
@@ -266,7 +440,7 @@ class AudioEngine {
   }
 
   seek(t: number): void {
-    const clamped = Math.min(Math.max(0, t), this.duration)
+    const clamped = Math.min(Math.max(0, t), this.timelineDuration)
     if (this.playing) this.play(clamped)
     else {
       this.startOffset = clamped
@@ -276,18 +450,16 @@ class AudioEngine {
 
   /** 当前播放头位置（秒）。暂停时返回记忆位置。 */
   getPosition(): number {
-    if (!this.buffer) return 0
+    if (!this.buffer && this.timeline.clips.length === 0) return 0
     if (!this.playing || !this.ctx) return this.startOffset
-    const elapsed = this.ctx.currentTime - this.startedAt
-    const dur = this.buffer.duration
+    const elapsed = Math.max(0, this.ctx.currentTime - this.startedAt)
+    const dur = this.timelineDuration
     if (this.loop) {
       const ls = this.range ? this.range.start : 0
       const le = this.range ? this.range.end : dur
       const len = Math.max(1e-6, le - ls)
       const absolute = this.startOffset + elapsed
-      // 起播点已在循环区间之后：不会回绕，只播放到音轨结尾
       if (this.startOffset >= le) return Math.min(dur, absolute)
-      // 起播点可能在循环区间中段，先走到 loopEnd 再进入循环
       if (absolute <= le) return Math.min(absolute, dur)
       return ls + ((absolute - le) % len)
     }
@@ -301,37 +473,42 @@ class AudioEngine {
     }
   }
 
-  /** 播放中切换循环时，必须同步更新正在播放的 source，否则会继续按旧状态循环 */
+  /** 循环切换由看门狗读取，无需改动正在播放的 source */
   setLoop(on: boolean): void {
     this.loop = on
-    if (this.source && this.playing) {
-      this.source.loop = on
-      this.source.loopStart = this.range ? this.range.start : 0
-      this.source.loopEnd = this.range ? this.range.end : this.buffer?.duration ?? 0
-    }
   }
 
-  /** 设置循环区间；播放中实时更新 loopStart/loopEnd */
   setRange(range: LoopRange | null): void {
     this.range = range
-    if (this.source && this.playing) {
-      this.source.loopStart = range ? range.start : 0
-      this.source.loopEnd = range ? range.end : this.buffer?.duration ?? 0
-    }
   }
 
-  private stopSource(): void {
+  private stopClipSources(): void {
+    for (const node of this.clipNodes) {
+      try {
+        node.source.stop()
+      } catch {
+        /* 尚未 start 时 stop 会抛错 */
+      }
+      node.source.disconnect()
+      node.gain.disconnect()
+      node.panner?.disconnect()
+    }
+    this.clipNodes = []
+  }
+
+  private stopAllSources(): void {
+    this.stopTick()
     if (this.source) {
       const src = this.source
       this.source = null
-      src.onended = null
       try {
         src.stop()
       } catch {
-        /* 尚未 start 时 stop 会抛错，忽略 */
+        /* 尚未 start 时 stop 会抛错 */
       }
       src.disconnect()
     }
+    this.stopClipSources()
   }
 }
 

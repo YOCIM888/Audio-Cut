@@ -60,6 +60,8 @@ const busyLabel = computed(() => {
       return `音频修复 ${Math.round(editor.busy.progress)}%`
     case 'batch':
       return `批量处理 ${Math.round(editor.busy.progress)}%`
+    case 'tracks':
+      return '正在解码多轨素材…'
     default:
       return ''
   }

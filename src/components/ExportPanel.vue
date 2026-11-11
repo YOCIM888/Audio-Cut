@@ -35,7 +35,7 @@ const sampleRate = ref(0) // 0 = 保持原采样率
 const bitDepth = ref<WavBitDepth>(16)
 const channelMode = ref<'keep' | 'mono' | 'stereo'>('keep')
 const bitrate = ref(192)
-const range = ref<'all' | 'selection'>('all')
+const range = ref<'all' | 'selection' | 'timeline'>('all')
 const fileName = ref('')
 const progress = ref(0)
 const phaseText = ref('')
@@ -65,6 +65,13 @@ watch(
   (v) => {
     // 选区被清除后不能停留在「选区导出」，否则导出会直接抛错
     if (!v && range.value === 'selection') range.value = 'all'
+  }
+)
+
+watch(
+  () => editor.hasMultitrack,
+  (v) => {
+    if (!v && range.value === 'timeline') range.value = 'all'
   }
 )
 
@@ -198,16 +205,25 @@ function cancelExport(): void {
 
     <div>
       <label class="field-label">范围</label>
-      <div class="flex gap-4 text-xs text-slate-300">
+      <div class="flex flex-wrap gap-x-4 gap-y-1.5 text-xs text-slate-300">
         <label class="flex items-center gap-1.5 cursor-pointer">
           <input type="radio" value="all" v-model="range" />
-          全曲
+          主轨全曲
         </label>
         <label class="flex items-center gap-1.5 cursor-pointer" :class="{ 'opacity-40': !editor.hasSelection }">
           <input type="radio" value="selection" v-model="range" :disabled="!editor.hasSelection" />
           选区{{ editor.hasSelection ? `（${(editor.selection.end - editor.selection.start).toFixed(1)}s）` : '（未框选）' }}
         </label>
+        <label class="flex items-center gap-1.5 cursor-pointer" :class="{ 'opacity-40': !editor.hasMultitrack }">
+          <input type="radio" value="timeline" v-model="range" :disabled="!editor.hasMultitrack" />
+          整条时间线混音
+        </label>
       </div>
+      <p v-if="range === 'timeline'" class="text-[10px] text-slate-500 mt-1.5 leading-relaxed">
+        长度 {{ editor.timelineLength.toFixed(1) }}s · {{ editor.tracks.length }} 轨 / {{ editor.clips.length }} 片段；
+        按 M/S、轨道增益与声像、片段淡变离线混合，静音轨与 Solo 规则与试听一致。
+      </p>
+      <p v-else class="text-[10px] text-slate-600 mt-1.5">仅导出主轨，不包含其它轨道的片段。</p>
     </div>
 
     <div>

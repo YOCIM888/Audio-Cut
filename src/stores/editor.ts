@@ -56,6 +56,27 @@ import {
 } from '../utils/audio-utils'
 import { runProcessTask } from '../utils/process-worker'
 import { setSourceFile } from '../utils/source-file'
+import {
+  audibleTrackIds,
+  clampClipTimes,
+  clipFileName,
+  clipMeta,
+  createClip,
+  createMainTrack,
+  createTrack,
+  dbToGain,
+  MAIN_TRACK_ID,
+  newId,
+  sanitizeClipMeta,
+  sanitizeTracks,
+  scheduledClips,
+  timelineDuration as computeTimelineDuration,
+  type ChainTarget,
+  type Clip,
+  type MultitrackState,
+  type SerializedMultitrack,
+  type Track
+} from '../audio/multitrack'
 
 /**
  * 音频命令：一次剪辑只记录「在 start 处用 after 替换掉 before」这一区间，
@@ -72,6 +93,9 @@ interface AudioCommand {
   chainAfter: EffectChainState
   selectionBefore: { start: number; end: number }
   positionBefore: number
+  /** 主轨剪辑会让后续片段整体平移，撤销时要一并还原（只存引用，不复制采样） */
+  clipsBefore: Clip[]
+  clipsAfter: Clip[]
 }
 
 /** 链快照：只记录前后两份指令，体积可忽略 */
@@ -81,7 +105,14 @@ interface ChainSnapshot {
   after: EffectChainState
 }
 
-export type Snapshot = AudioCommand | ChainSnapshot
+/** 多轨快照：只复制元信息，channels 共享不可变引用 */
+interface MultitrackSnapshot {
+  kind: 'multitrack'
+  before: MultitrackState
+  after: MultitrackState
+}
+
+export type Snapshot = AudioCommand | ChainSnapshot | MultitrackSnapshot
 
 export interface LoadOptions {
   selection?: { start: number; end: number }
@@ -102,7 +133,10 @@ export interface ViewState {
   viewMode?: WaveViewMode
   markers?: unknown
   noiseProfile?: unknown
+  mainView?: MainViewMode
 }
+
+export type MainViewMode = 'waveform' | 'timeline'
 
 const VALID_TABS: SidebarTab[] = [
   'edit',
@@ -114,7 +148,8 @@ const VALID_TABS: SidebarTab[] = [
   'measure',
   'marks',
   'repair',
-  'batch'
+  'batch',
+  'tracks'
 ]
 
 /** 吸附网格（秒）；0 表示关闭网格、按采样点精确对齐 */
@@ -153,6 +188,7 @@ export type SidebarTab =
   | 'marks'
   | 'repair'
   | 'batch'
+  | 'tracks'
 export type BusyType =
   | 'decode'
   | 'stretch'
@@ -161,6 +197,7 @@ export type BusyType =
   | 'analyze'
   | 'repair'
   | 'batch'
+  | 'tracks'
   | null
 export type FadeCurve = 'linear' | 'cosine' | 'exponential' | 'logarithmic'
 export type WaveViewMode = 'waveform' | 'spectrum' | 'both'
@@ -203,6 +240,16 @@ export const useEditorStore = defineStore('editor', () => {
   const noiseProfile = shallowRef<NoiseProfile | null>(null)
   const segments = ref<AudioSegment[]>([])
   const loudnessStats = shallowRef<LoudnessStats | null>(null)
+
+  // ---- 多轨时间线（clips 含大数组，必须 shallowRef + 整体替换） ----
+  const tracks = ref<Track[]>([createMainTrack()])
+  const clips = shallowRef<Clip[]>([])
+  /** 效果链只插在主轨，还是插在整个混音上 */
+  const chainTarget = ref<ChainTarget>('main')
+  const mainView = ref<MainViewMode>('waveform')
+  const selectedClipId = ref<string | null>(null)
+  const timelineDragging = ref(false)
+
   const hasClipboard = ref(false)
   const pendingView = ref(false) // 由工程加载设置视图，跳过自动适应窗口
   const isPlaying = ref(false)
@@ -235,6 +282,15 @@ export const useEditorStore = defineStore('editor', () => {
     snapGrid.value > 0 ? snapGrid.value : 1 / (buffer.value?.sampleRate ?? 48000)
   )
   const silenceSegmentCount = computed(() => segments.value.filter((s) => s.kind === 'silence').length)
+  const hasMultitrack = computed(() => clips.value.length > 0)
+  const timelineLength = computed(() => computeTimelineDuration(duration.value, clips.value))
+  const audibleTracks = computed(() => audibleTrackIds(tracks.value))
+  const selectedClip = computed(() => clips.value.find((c) => c.id === selectedClipId.value) ?? null)
+  const trackClipCount = computed(() => {
+    const map = new Map<string, number>()
+    for (const c of clips.value) map.set(c.trackId, (map.get(c.trackId) ?? 0) + 1)
+    return map
+  })
 
   audioEngine.onEnded = () => {
     isPlaying.value = false
@@ -416,17 +472,23 @@ export const useEditorStore = defineStore('editor', () => {
       selection.start = 0
       selection.end = 0
     }
-    // 标记点跟随区间长度变化：被替换区间之后的点整体平移，其余裁到新时长
+    // 标记点与多轨片段跟随区间长度变化：被替换区间之后的点整体平移
+    const delta = (inserted[0]?.length ?? 0) - removeFrames
+    const sr = newBuf.sampleRate
+    const cutEnd = start + removeFrames
     if (markers.value.length) {
-      const delta = (inserted[0]?.length ?? 0) - removeFrames
-      const sr = newBuf.sampleRate
-      const cutEnd = start + removeFrames
       markers.value = sortMarkers(
         markers.value.map((m) => {
           const frame = m.time * sr
           const next = frame >= cutEnd ? Math.max(0, frame + delta) : frame
           return { ...m, time: clamp(next / sr, 0, newBuf.duration) }
         })
+      )
+    }
+    if (clips.value.length && delta !== 0) {
+      const shift = delta / sr
+      clips.value = clips.value.map((c) =>
+        c.start >= cutEnd / sr - 1e-6 ? { ...c, start: Math.max(0, c.start + shift) } : c
       )
     }
     invalidateAnalysis()
@@ -457,7 +519,9 @@ export const useEditorStore = defineStore('editor', () => {
       chainBefore: cloneChain(chain.value),
       chainAfter: cloneChain(chainAfter ?? chain.value),
       selectionBefore: { start: selection.start, end: selection.end },
-      positionBefore: audioEngine.getPosition()
+      positionBefore: audioEngine.getPosition(),
+      clipsBefore: clips.value.slice(),
+      clipsAfter: []
     }
   }
 
@@ -469,6 +533,7 @@ export const useEditorStore = defineStore('editor', () => {
     trimHistory()
     historyVersion.value++
     applyAudioData(cmd.start, cmd.before[0]?.length ?? 0, cmd.after)
+    cmd.clipsAfter = clips.value.slice()
     restoreChain(cmd.chainAfter)
   }
 
@@ -507,6 +572,7 @@ export const useEditorStore = defineStore('editor', () => {
     past.length = 0
     future.length = 0
     clearPendingChain()
+    clearPendingMultitrack()
     historyVersion.value++
     installBuffer(decoded)
     fileName.value = name
@@ -558,6 +624,347 @@ export const useEditorStore = defineStore('editor', () => {
         : null
     }
     if (state.sidebarTab && VALID_TABS.includes(state.sidebarTab)) sidebarTab.value = state.sidebarTab
+    if (state.mainView === 'waveform' || state.mainView === 'timeline') mainView.value = state.mainView
+  }
+
+  // ---- 多轨时间线 ----
+  function multitrackState(): MultitrackState {
+    return { tracks: tracks.value, clips: clips.value, chainTarget: chainTarget.value }
+  }
+
+  /** 工程文件 / IndexedDB 用的元信息快照（不含任何采样字节） */
+  function serializeMultitrack(): SerializedMultitrack {
+    return {
+      tracks: tracks.value.map((t) => ({ ...t })),
+      clips: clips.value.map((c) => clipMeta(c, clipFileName(c.id))),
+      chainTarget: chainTarget.value
+    }
+  }
+
+  function restoreMultitrack(state: MultitrackState): void {
+    tracks.value = state.tracks.map((t) => ({ ...t }))
+    clips.value = state.clips.slice()
+    chainTarget.value = state.chainTarget
+    if (!clips.value.some((c) => c.id === selectedClipId.value)) selectedClipId.value = null
+  }
+
+  function mtSignature(s: MultitrackState): string {
+    return JSON.stringify({
+      t: s.tracks.map((t) => [t.id, t.name, t.muted, t.solo, t.gainDb, t.pan]),
+      c: s.clips.map((c) => [c.id, c.trackId, c.name, c.start, c.offset, c.duration, c.gainDb, c.fadeInMs, c.fadeOutMs]),
+      x: s.chainTarget
+    })
+  }
+
+  let pendingMultitrackBefore: MultitrackState | null = null
+  let mtTimer: number | null = null
+
+  function currentMultitrack(): MultitrackState {
+    return {
+      tracks: tracks.value.map((t) => ({ ...t })),
+      clips: clips.value.slice(),
+      chainTarget: chainTarget.value
+    }
+  }
+
+  /** 结算挂起的滑杆拖动，保证历史顺序与真实操作顺序一致 */
+  function flushMultitrackHistory(): void {
+    if (mtTimer !== null) {
+      window.clearTimeout(mtTimer)
+      mtTimer = null
+    }
+    const before = pendingMultitrackBefore
+    pendingMultitrackBefore = null
+    if (!before) return
+    const after = currentMultitrack()
+    if (mtSignature(before) === mtSignature(after)) return
+    past.push({ kind: 'multitrack', before, after })
+    future.length = 0
+    trimHistory()
+    historyVersion.value++
+  }
+
+  /**
+   * 一次离散操作记录一条多轨撤销；coalesce=true 用于滑杆连续输入。
+   * 采样数据只共享引用，不进历史栈内存预算。
+   */
+  function mutateMultitrack(fn: (draft: MultitrackState) => void, coalesce = false): void {
+    const before = currentMultitrack()
+    const draft: MultitrackState = {
+      tracks: before.tracks.map((t) => ({ ...t })),
+      clips: before.clips.slice(),
+      chainTarget: before.chainTarget
+    }
+    fn(draft)
+    if (mtSignature(before) === mtSignature(draft)) return
+    if (!coalesce) {
+      flushChainHistory()
+      flushMultitrackHistory()
+    }
+    restoreMultitrack(draft)
+    if (coalesce) {
+      if (!pendingMultitrackBefore) pendingMultitrackBefore = before
+      if (mtTimer !== null) window.clearTimeout(mtTimer)
+      mtTimer = window.setTimeout(() => {
+        mtTimer = null
+        flushMultitrackHistory()
+      }, CHAIN_COMMIT_DELAY)
+    } else {
+      past.push({ kind: 'multitrack', before, after: currentMultitrack() })
+      future.length = 0
+      trimHistory()
+      historyVersion.value++
+    }
+  }
+
+  /** 时间线拖动预览：不写历史、不重启播放，松手时由 commitClipDrag 结算 */
+  function previewClips(next: Clip[]): void {
+    clips.value = next
+  }
+
+  function setTimelineDragging(value: boolean): void {
+    timelineDragging.value = value
+    if (!value) resyncTimeline()
+  }
+
+  /** 拖动前调用一次保存 before，松手时结算为一条撤销 */
+  function commitClipDrag(before: MultitrackState): void {
+    const after: MultitrackState = {
+      tracks: tracks.value.map((t) => ({ ...t })),
+      clips: clips.value.slice(),
+      chainTarget: chainTarget.value
+    }
+    if (mtSignature(before) !== mtSignature(after)) {
+      past.push({ kind: 'multitrack', before, after })
+      future.length = 0
+      trimHistory()
+      historyVersion.value++
+    }
+    resyncTimeline()
+  }
+
+  function beginClipDrag(): MultitrackState {
+    flushChainHistory()
+    flushMultitrackHistory()
+    return {
+      tracks: tracks.value.map((t) => ({ ...t })),
+      clips: clips.value.slice(),
+      chainTarget: chainTarget.value
+    }
+  }
+
+  /** 把当前多轨布局同步到播放引擎；播放中默认从当前位置重新排程 */
+  function resyncTimeline(restart = true): void {
+    const state = multitrackState()
+    const audible = audibleTrackIds(state.tracks)
+    const main = state.tracks.find((t) => t.kind === 'main')
+    audioEngine.setTimeline(
+      {
+        clips: scheduledClips(state, audible),
+        duration: computeTimelineDuration(buffer.value?.duration ?? 0, state.clips),
+        chainTarget: state.chainTarget,
+        mainGain: audible.has(MAIN_TRACK_ID) ? dbToGain(main?.gainDb ?? 0) : 0,
+        mainPan: main?.pan ?? 0
+      },
+      restart
+    )
+  }
+
+  function addTrack(name?: string): string {
+    const id = newId('track')
+    mutateMultitrack((d) => {
+      const t = createTrack(d.tracks.length)
+      t.id = id
+      if (name) t.name = name.slice(0, 60)
+      d.tracks.push(t)
+    })
+    return id
+  }
+
+  function removeTrack(id: string): void {
+    if (id === MAIN_TRACK_ID) return
+    mutateMultitrack((d) => {
+      d.tracks = d.tracks.filter((t) => t.id !== id)
+      d.clips = d.clips.filter((c) => c.trackId !== id)
+    })
+    if (!clips.value.some((c) => c.id === selectedClipId.value)) selectedClipId.value = null
+  }
+
+  function clearPendingMultitrack(): void {
+    if (mtTimer !== null) window.clearTimeout(mtTimer)
+    mtTimer = null
+    pendingMultitrackBefore = null
+  }
+
+  function updateTrack(id: string, patch: Partial<Pick<Track, 'name' | 'muted' | 'solo' | 'gainDb' | 'pan' | 'color'>>): void {
+    const coalesce = patch.gainDb !== undefined || patch.pan !== undefined
+    mutateMultitrack((d) => {
+      const t = d.tracks.find((x) => x.id === id)
+      if (!t) return
+      if (patch.name !== undefined) t.name = patch.name.slice(0, 60)
+      if (patch.muted !== undefined) t.muted = patch.muted
+      if (patch.solo !== undefined) t.solo = patch.solo
+      if (patch.gainDb !== undefined) t.gainDb = clamp(patch.gainDb, -60, 12)
+      if (patch.pan !== undefined) t.pan = clamp(patch.pan, -1, 1)
+      if (patch.color !== undefined) t.color = patch.color
+    }, coalesce)
+  }
+
+  function setChainTarget(target: ChainTarget): void {
+    mutateMultitrack((d) => {
+      d.chainTarget = target
+    })
+  }
+
+  function setMainView(mode: MainViewMode): void {
+    mainView.value = mode
+  }
+
+  function selectClip(id: string | null): void {
+    selectedClipId.value = id
+  }
+
+  /** 插入一个片段。默认放到当前播放头位置；没有指定轨道时自动新建一条 */
+  function addClip(
+    channels: Float32Array[],
+    sampleRate: number,
+    name: string,
+    start?: number,
+    trackId?: string
+  ): string {
+    let targetId = trackId ?? ''
+    if (targetId && !tracks.value.some((t) => t.id === targetId && t.kind === 'audio')) return ''
+    const at = start ?? audioEngine.getPosition()
+    // 自动建轨与插入片段合并成一条撤销
+    const newTrack = targetId ? null : createTrack(tracks.value.length)
+    if (newTrack) {
+      newTrack.name = name.slice(0, 60) || newTrack.name
+      targetId = newTrack.id
+    }
+    const clip = createClip(channels, sampleRate, targetId, name, at)
+    mutateMultitrack((d) => {
+      if (newTrack) d.tracks.push(newTrack)
+      d.clips.push(clip)
+    })
+    selectedClipId.value = clip.id
+    return clip.id
+  }
+
+  function updateClip(
+    id: string,
+    patch: Partial<Pick<Clip, 'name' | 'gainDb' | 'fadeInMs' | 'fadeOutMs' | 'start' | 'offset' | 'duration' | 'trackId'>>
+  ): void {
+    mutateMultitrack((d) => {
+      const i = d.clips.findIndex((c) => c.id === id)
+      if (i < 0) return
+      const c = d.clips[i]
+      const times = clampClipTimes(c, patch)
+      d.clips[i] = {
+        ...c,
+        ...times,
+        name: patch.name !== undefined ? patch.name.slice(0, 120) : c.name,
+        gainDb: patch.gainDb !== undefined ? clamp(patch.gainDb, -60, 12) : c.gainDb,
+        fadeInMs: patch.fadeInMs !== undefined ? clamp(patch.fadeInMs, 0, 10000) : c.fadeInMs,
+        fadeOutMs: patch.fadeOutMs !== undefined ? clamp(patch.fadeOutMs, 0, 10000) : c.fadeOutMs,
+        trackId: patch.trackId && d.tracks.some((t) => t.id === patch.trackId && t.kind === 'audio') ? patch.trackId : c.trackId
+      }
+    })
+  }
+
+  function removeClip(id: string): void {
+    mutateMultitrack((d) => {
+      d.clips = d.clips.filter((c) => c.id !== id)
+    })
+    if (selectedClipId.value === id) selectedClipId.value = null
+  }
+
+  function duplicateClip(id: string): void {
+    mutateMultitrack((d) => {
+      const c = d.clips.find((x) => x.id === id)
+      if (!c) return
+      d.clips.push({ ...c, id: newId('clip'), name: `${c.name} 副本`, start: c.start + c.duration })
+    })
+  }
+
+  /** 在时间轴 at 秒处拆成两段；落点在片段外时不动 */
+  function splitClip(id: string, at: number): void {
+    mutateMultitrack((d) => {
+      const i = d.clips.findIndex((c) => c.id === id)
+      if (i < 0) return
+      const c = d.clips[i]
+      const cut = at - c.start
+      if (cut <= 0.01 || cut >= c.duration - 0.01) return
+      const left: Clip = { ...c, duration: cut }
+      const right: Clip = {
+        ...c,
+        id: newId('clip'),
+        name: `${c.name} (2)`,
+        start: c.start + cut,
+        offset: c.offset + cut,
+        duration: c.duration - cut
+      }
+      d.clips.splice(i, 1, left, right)
+    })
+  }
+
+  function clearMultitrack(): void {
+    mutateMultitrack((d) => {
+      d.tracks = [createMainTrack()]
+      d.clips = []
+      d.chainTarget = 'main'
+    })
+    selectedClipId.value = null
+  }
+
+  /**
+   * 工程恢复：元信息 + 每个片段的无损 PCM。
+   * 缺失或声道数不符的片段会被跳过，其余仍可完整恢复。
+   */
+  function loadMultitrack(
+    rawTracks: unknown,
+    rawClips: unknown,
+    audio: Map<string, { channels: Float32Array[]; sampleRate: number }>,
+    target: unknown
+  ): number {
+    const list = sanitizeTracks(rawTracks)
+    const ids = new Set(list.map((t) => t.id))
+    const metas = sanitizeClipMeta(rawClips, ids)
+    const restored: Clip[] = []
+    for (const m of metas) {
+      const a = audio.get(m.file)
+      if (!a || !a.channels.length) continue
+      restored.push({
+        id: m.id,
+        trackId: m.trackId,
+        name: m.name,
+        start: m.start,
+        offset: m.offset,
+        duration: m.duration,
+        sourceDuration: m.sourceDuration || a.channels[0].length / a.sampleRate,
+        channels: a.channels,
+        sampleRate: a.sampleRate,
+        gainDb: m.gainDb,
+        fadeInMs: m.fadeInMs,
+        fadeOutMs: m.fadeOutMs
+      })
+    }
+    tracks.value = list
+    clips.value = restored
+    chainTarget.value = target === 'mix' ? 'mix' : 'main'
+    selectedClipId.value = null
+    past.length = 0
+    future.length = 0
+    clearPendingChain()
+    clearPendingMultitrack()
+    historyVersion.value++
+    resyncTimeline(false)
+    return restored.length
+  }
+
+  /** 供导出使用：当前可听的片段（已应用 M/S 过滤） */
+  function audibleClips(): Clip[] {
+    const ids = audibleTrackIds(tracks.value)
+    return clips.value.filter((c) => ids.has(c.trackId))
   }
 
   // ---- 效果链动作 ----
@@ -712,6 +1119,13 @@ export const useEditorStore = defineStore('editor', () => {
           : null
       )
     },
+    { immediate: true }
+  )
+
+  /** 多轨布局变化同步到引擎；拖动期间只更新数据，松手时才重新排程 */
+  watch(
+    [clips, tracks, chainTarget, buffer],
+    () => resyncTimeline(!timelineDragging.value),
     { immediate: true }
   )
 
@@ -1582,16 +1996,21 @@ export const useEditorStore = defineStore('editor', () => {
     // 异步处理期间不允许撤销，否则会把半成品写入历史栈
     if (busy.type) return
     flushChainHistory()
+    flushMultitrackHistory()
     const snap = past.pop()
     if (!snap) return
     if (snap.kind === 'audio') {
       future.push(snap)
       applyAudioData(snap.start, snap.after[0]?.length ?? 0, snap.before)
+      clips.value = snap.clipsBefore.slice()
       restoreChain(snap.chainBefore)
       restoreCommandContext(snap)
-    } else {
+    } else if (snap.kind === 'chain') {
       future.push(snap)
       restoreChain(snap.before)
+    } else {
+      future.push(snap)
+      restoreMultitrack(snap.before)
     }
     trimHistory()
     historyVersion.value++
@@ -1600,15 +2019,20 @@ export const useEditorStore = defineStore('editor', () => {
   function redo(): void {
     if (busy.type) return
     flushChainHistory()
+    flushMultitrackHistory()
     const snap = future.pop()
     if (!snap) return
     if (snap.kind === 'audio') {
       past.push(snap)
       applyAudioData(snap.start, snap.before[0]?.length ?? 0, snap.after)
+      clips.value = snap.clipsAfter.slice()
       restoreChain(snap.chainAfter)
-    } else {
+    } else if (snap.kind === 'chain') {
       past.push(snap)
       restoreChain(snap.after)
+    } else {
+      past.push(snap)
+      restoreMultitrack(snap.after)
     }
     trimHistory()
     historyVersion.value++
@@ -1616,7 +2040,7 @@ export const useEditorStore = defineStore('editor', () => {
 
   // ---- 播放控制 ----
   function togglePlay(from?: number): void {
-    if (!buffer.value) return
+    if (!buffer.value && !hasMultitrack.value) return
     if (audioEngine.isPlaying) {
       audioEngine.pause()
       isPlaying.value = false
@@ -1624,7 +2048,7 @@ export const useEditorStore = defineStore('editor', () => {
     }
     syncLoopRange()
     let pos = from ?? audioEngine.getPosition()
-    if (pos >= duration.value - 0.01) {
+    if (pos >= timelineLength.value - 0.01) {
       pos = isLooping.value && hasSelection.value ? selection.start : 0
     }
     audioEngine.play(pos)
@@ -1683,6 +2107,13 @@ export const useEditorStore = defineStore('editor', () => {
     volume,
     sidebarTab,
     busy,
+    tracks,
+    clips,
+    chainTarget,
+    mainView,
+    selectedClipId,
+    selectedClip,
+    timelineDragging,
     chain,
     chainActiveNow,
     activeEffectCount,
@@ -1692,6 +2123,10 @@ export const useEditorStore = defineStore('editor', () => {
     canRedo,
     nudgeStep,
     silenceSegmentCount,
+    hasMultitrack,
+    timelineLength,
+    audibleTracks,
+    trackClipCount,
     loadFile,
     loadDecodedBuffer,
     applyViewState,
@@ -1752,6 +2187,28 @@ export const useEditorStore = defineStore('editor', () => {
     setSpectrogram,
     setNoiseProfile,
     clearLoudnessStats,
+    serializeMultitrack,
+    multitrackState,
+    restoreMultitrack,
+    resyncTimeline,
+    addTrack,
+    removeTrack,
+    updateTrack,
+    setChainTarget,
+    setMainView,
+    selectClip,
+    addClip,
+    updateClip,
+    removeClip,
+    duplicateClip,
+    splitClip,
+    clearMultitrack,
+    loadMultitrack,
+    audibleClips,
+    previewClips,
+    beginClipDrag,
+    commitClipDrag,
+    setTimelineDragging,
     undo,
     redo,
     togglePlay,
