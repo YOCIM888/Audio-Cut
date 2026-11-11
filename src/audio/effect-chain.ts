@@ -8,7 +8,15 @@
  *   - 导出 / 固化：离线渲染（见 effects.ts），保证结果与试听一致但精确到采样。
  */
 
-export type EffectKind = 'highpass' | 'lowpass' | 'peaking' | 'compressor' | 'gain' | 'gate'
+export type EffectKind =
+  | 'highpass'
+  | 'lowpass'
+  | 'lowshelf'
+  | 'highshelf'
+  | 'peaking'
+  | 'compressor'
+  | 'gain'
+  | 'gate'
 
 interface NodeBase {
   id: string
@@ -23,6 +31,18 @@ export interface HighPassNode extends NodeBase {
 export interface LowPassNode extends NodeBase {
   kind: 'lowpass'
   hz: number
+  q: number
+}
+export interface LowShelfNode extends NodeBase {
+  kind: 'lowshelf'
+  hz: number
+  gainDb: number
+  q: number
+}
+export interface HighShelfNode extends NodeBase {
+  kind: 'highshelf'
+  hz: number
+  gainDb: number
   q: number
 }
 export interface PeakingNode extends NodeBase {
@@ -51,6 +71,8 @@ export interface GateNode extends NodeBase {
 export type EffectNode =
   | HighPassNode
   | LowPassNode
+  | LowShelfNode
+  | HighShelfNode
   | PeakingNode
   | CompressorNode
   | GainNodeSpec
@@ -73,6 +95,8 @@ export interface EffectMeta {
 export const EFFECT_META: Record<EffectKind, EffectMeta> = {
   highpass: { label: '低切 / 高通', short: 'HP', hint: '滤除低频隆隆声与风噪' },
   lowpass: { label: '高切 / 低通', short: 'LP', hint: '滤除高频嘶声' },
+  lowshelf: { label: '低频架式 EQ', short: 'LS', hint: '整体提升或衰减低频' },
+  highshelf: { label: '高频架式 EQ', short: 'HS', hint: '整体提升或衰减高频' },
   peaking: { label: '参数 EQ', short: 'EQ', hint: '提升或衰减指定频段' },
   compressor: { label: '动态压缩', short: 'COMP', hint: '收窄动态范围' },
   gain: { label: '增益', short: 'GAIN', hint: '整体电平增减（dB）' },
@@ -94,6 +118,10 @@ export function createNode(kind: EffectKind): EffectNode {
       return { ...base, kind, hz: 80, q: 0.707 }
     case 'lowpass':
       return { ...base, kind, hz: 12000, q: 0.707 }
+    case 'lowshelf':
+      return { ...base, kind, hz: 120, gainDb: 3, q: 0.707 }
+    case 'highshelf':
+      return { ...base, kind, hz: 8000, gainDb: 3, q: 0.707 }
     case 'peaking':
       return { ...base, kind, hz: 3000, gainDb: 3, q: 1 }
     case 'compressor':
@@ -172,6 +200,18 @@ export function paramSpecs(node: EffectNode): ParamSpec[] {
       return [
         p('hz', '截止频率', 1000, 20000, 100, node.hz, 'Hz'),
         p('q', 'Q 值', 0.3, 3, 0.1, node.q, '', 2)
+      ]
+    case 'lowshelf':
+      return [
+        p('hz', '转折频率', 20, 1000, 10, node.hz, 'Hz'),
+        p('gainDb', '增益', -18, 18, 0.5, node.gainDb, 'dB', 1),
+        p('q', '斜率 Q', 0.3, 3, 0.1, node.q, '', 2)
+      ]
+    case 'highshelf':
+      return [
+        p('hz', '转折频率', 1000, 20000, 100, node.hz, 'Hz'),
+        p('gainDb', '增益', -18, 18, 0.5, node.gainDb, 'dB', 1),
+        p('q', '斜率 Q', 0.3, 3, 0.1, node.q, '', 2)
       ]
     case 'peaking':
       return [
@@ -260,6 +300,17 @@ export const CHAIN_PRESETS: ChainPreset[] = [
       chain([
         { ...createNode('peaking'), hz: 100, gainDb: 4, q: 0.8 } as PeakingNode,
         { ...createNode('compressor'), thresholdDb: -12, ratio: 2 } as CompressorNode
+      ])
+  },
+  {
+    name: '多段 EQ',
+    hint: '低架 120Hz / 中低 250Hz / 中高 3kHz / 高架 9kHz，可在曲线上拖动控制点',
+    build: () =>
+      chain([
+        { ...createNode('lowshelf'), hz: 120, gainDb: 2 } as LowShelfNode,
+        { ...createNode('peaking'), hz: 250, gainDb: -2, q: 1.2 } as PeakingNode,
+        { ...createNode('peaking'), hz: 3000, gainDb: 2.5, q: 0.9 } as PeakingNode,
+        { ...createNode('highshelf'), hz: 9000, gainDb: 1.5 } as HighShelfNode
       ])
   }
 ]

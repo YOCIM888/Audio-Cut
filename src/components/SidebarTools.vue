@@ -6,16 +6,29 @@ import EffectsPanel from './EffectsPanel.vue'
 import MergePanel from './MergePanel.vue'
 import VideoExtractPanel from './VideoExtractPanel.vue'
 import ExportPanel from './ExportPanel.vue'
+import AnalysisPanel from './AnalysisPanel.vue'
+import MarkersPanel from './MarkersPanel.vue'
+import RepairPanel from './RepairPanel.vue'
+import BatchPanel from './BatchPanel.vue'
 
 const editor = useEditorStore()
 
-const tabs: { key: SidebarTab; label: string }[] = [
-  { key: 'edit', label: '编辑' },
-  { key: 'effects', label: '效果链' },
-  { key: 'speed', label: '变速' },
-  { key: 'merge', label: '合并' },
-  { key: 'extract', label: '提取' },
-  { key: 'export', label: '导出' }
+/** 两行分组：第一行是基础剪辑，第二行是测量 / 导航 / 修复 / 自动化 */
+const tabRows: { key: SidebarTab; label: string; title: string }[][] = [
+  [
+    { key: 'edit', label: '编辑', title: '剪切、复制、粘贴、淡变' },
+    { key: 'effects', label: '效果链', title: '非破坏性多段 EQ 与动态效果' },
+    { key: 'speed', label: '变速', title: 'WSOLA 变速 / 保持音调' },
+    { key: 'merge', label: '合并', title: '多段音频拼接' },
+    { key: 'extract', label: '提取', title: '从视频中提取音频' }
+  ],
+  [
+    { key: 'measure', label: '测量', title: 'LUFS / RMS / 真峰值 / 频谱图' },
+    { key: 'marks', label: '标记', title: 'Cue 列表、吸附精度、静音分段' },
+    { key: 'repair', label: '修复', title: '降噪 / 去咔嗒 / 限制器 / 变调' },
+    { key: 'batch', label: '批量', title: '多文件串行处理与批量导出' },
+    { key: 'export', label: '导出', title: 'WAV / MP3 / FLAC / M4A / OGG / WebM' }
+  ]
 ]
 
 const ratio = ref(1)
@@ -30,16 +43,17 @@ async function applyStretch(): Promise<void> {
 
 <template>
   <aside class="w-80 shrink-0 border-l border-neon/15 bg-abyss-900/70 backdrop-blur flex flex-col">
-    <nav class="flex border-b border-neon/15">
+    <nav class="grid grid-cols-5 border-b border-neon/15">
       <button
-        v-for="tab in tabs"
+        v-for="tab in tabRows.flat()"
         :key="tab.key"
-        class="flex-1 py-2.5 text-xs tracking-[0.1em] transition-colors"
+        class="py-1.5 text-[11px] tracking-[0.04em] transition-colors"
         :class="
           editor.sidebarTab === tab.key
             ? 'text-neon border-b-2 border-neon bg-neon/5 glow-text'
             : 'text-slate-500 hover:text-slate-300'
         "
+        :title="tab.title"
         @click="editor.sidebarTab = tab.key"
       >
         {{ tab.label }}
@@ -106,6 +120,14 @@ async function applyStretch(): Promise<void> {
       <MergePanel v-else-if="editor.sidebarTab === 'merge'" />
 
       <VideoExtractPanel v-else-if="editor.sidebarTab === 'extract'" />
+
+      <AnalysisPanel v-else-if="editor.sidebarTab === 'measure'" />
+
+      <MarkersPanel v-else-if="editor.sidebarTab === 'marks'" />
+
+      <RepairPanel v-else-if="editor.sidebarTab === 'repair'" />
+
+      <BatchPanel v-else-if="editor.sidebarTab === 'batch'" />
 
       <ExportPanel v-else-if="editor.sidebarTab === 'export'" />
     </div>

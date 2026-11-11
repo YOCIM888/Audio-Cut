@@ -11,9 +11,11 @@
  * 不会阻塞编辑器主流程。
  */
 import type { EffectChainState } from '../audio/effect-chain'
+import type { Marker } from '../audio/markers'
+import type { NoiseProfile } from '../audio/spectral'
 
 export const ACTIVE_ID = 'active'
-export const SESSION_VERSION = 3
+export const SESSION_VERSION = 4
 
 const DB_NAME = 'yocim-audio-cut'
 const DB_VERSION = 1
@@ -37,6 +39,11 @@ export interface SessionMeta {
   volume: number
   sidebarTab: string
   chain: EffectChainState
+  /** 标记点、吸附精度、波形视图模式与噪声指纹（v4 起） */
+  markers: Marker[]
+  snapGrid: number
+  viewMode: 'waveform' | 'spectrum' | 'both'
+  noiseProfile: NoiseProfile | null
   /** 当前 session 对应的 audio 记录版本；刷新时用于检测音频是否落后于指令 */
   audioKey: number
   audioBytes: number

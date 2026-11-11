@@ -54,6 +54,12 @@ const busyLabel = computed(() => {
       return `合并中 ${Math.round(editor.busy.progress)}%`
     case 'effects':
       return `效果渲染中 ${Math.round(editor.busy.progress)}%`
+    case 'analyze':
+      return `响度分析 ${Math.round(editor.busy.progress)}%`
+    case 'repair':
+      return `音频修复 ${Math.round(editor.busy.progress)}%`
+    case 'batch':
+      return `批量处理 ${Math.round(editor.busy.progress)}%`
     default:
       return ''
   }

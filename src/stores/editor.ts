@@ -13,6 +13,24 @@ import { audioEngine } from '../audio/engine'
 import { startPeakBuild, type PeakBuild, type PeakCache } from '../audio/peaks'
 import { useToastStore } from './toast'
 import { renderChain } from '../audio/effects'
+import { newMarkerId, sanitizeMarkers, sortMarkers, type Marker } from '../audio/markers'
+import { normalizeGain, type LoudnessStats } from '../audio/loudness'
+import {
+  NOISE_BANDS,
+  sanitizeNoiseProfile,
+  type AudioSegment,
+  type NoiseProfile,
+  type Spectrogram
+} from '../audio/spectral'
+import {
+  analyzeAudio,
+  captureNoiseProfile,
+  declickAudio,
+  denoiseAudio,
+  detectSilence,
+  limitAudio,
+  shiftPitch
+} from '../utils/analysis-client'
 import {
   applyParamPatch,
   chainActive,
@@ -71,6 +89,7 @@ export interface LoadOptions {
   scrollX?: number
   vGain?: number
   chain?: EffectChainState
+  markers?: Marker[]
 }
 
 /** 工程/本地备份恢复时一并还原的界面标志位（不含音频与撤销栈） */
@@ -79,9 +98,35 @@ export interface ViewState {
   isLooping?: boolean
   volume?: number
   sidebarTab?: SidebarTab
+  snapGrid?: number
+  viewMode?: WaveViewMode
+  markers?: unknown
+  noiseProfile?: unknown
 }
 
-const VALID_TABS: SidebarTab[] = ['edit', 'effects', 'speed', 'merge', 'extract', 'export']
+const VALID_TABS: SidebarTab[] = [
+  'edit',
+  'effects',
+  'speed',
+  'merge',
+  'extract',
+  'export',
+  'measure',
+  'marks',
+  'repair',
+  'batch'
+]
+
+/** 吸附网格（秒）；0 表示关闭网格、按采样点精确对齐 */
+export const SNAP_GRIDS = [
+  { label: '采样点', value: 0 },
+  { label: '1 ms', value: 0.001 },
+  { label: '10 ms', value: 0.01 },
+  { label: '50 ms', value: 0.05 },
+  { label: '0.1 s', value: 0.1 },
+  { label: '0.5 s', value: 0.5 },
+  { label: '1 s', value: 1 }
+] as const
 
 interface ClipboardData {
   channels: Float32Array[]
@@ -97,9 +142,35 @@ export interface MergeClipInput {
   sampleRate: number
 }
 
-export type SidebarTab = 'edit' | 'effects' | 'speed' | 'merge' | 'extract' | 'export'
-export type BusyType = 'decode' | 'stretch' | 'merge' | 'effects' | null
+export type SidebarTab =
+  | 'edit'
+  | 'effects'
+  | 'speed'
+  | 'merge'
+  | 'extract'
+  | 'export'
+  | 'measure'
+  | 'marks'
+  | 'repair'
+  | 'batch'
+export type BusyType =
+  | 'decode'
+  | 'stretch'
+  | 'merge'
+  | 'effects'
+  | 'analyze'
+  | 'repair'
+  | 'batch'
+  | null
 export type FadeCurve = 'linear' | 'cosine' | 'exponential' | 'logarithmic'
+export type WaveViewMode = 'waveform' | 'spectrum' | 'both'
+
+export interface SilencePresetOptions {
+  thresholdDb: number
+  minSilenceMs: number
+  minSoundMs: number
+  padMs: number
+}
 
 const MAX_HISTORY = 30
 /** 撤销栈总内存预算（字节）。命令式历史只存改动片段，预算相应收紧 */
@@ -124,6 +195,14 @@ export const useEditorStore = defineStore('editor', () => {
   const scrollX = ref(0) // px
   const vGain = ref(1) // 垂直振幅缩放（纯显示，不改数据）
   const zeroSnap = ref(false) // 选区边缘吸附零交叉点
+  const snapGrid = ref(0.1) // 时间网格吸附精度，0 = 采样级
+  const viewMode = ref<WaveViewMode>('waveform')
+  const spectrogram = shallowRef<Spectrogram | null>(null)
+  const spectrogramProgress = ref(1)
+  const markers = ref<Marker[]>([])
+  const noiseProfile = shallowRef<NoiseProfile | null>(null)
+  const segments = ref<AudioSegment[]>([])
+  const loudnessStats = shallowRef<LoudnessStats | null>(null)
   const hasClipboard = ref(false)
   const pendingView = ref(false) // 由工程加载设置视图，跳过自动适应窗口
   const isPlaying = ref(false)
@@ -151,6 +230,11 @@ export const useEditorStore = defineStore('editor', () => {
   const hasSelection = computed(() => selection.end - selection.start > 1e-4)
   const canUndo = computed(() => historyVersion.value >= 0 && past.length > 0)
   const canRedo = computed(() => historyVersion.value >= 0 && future.length > 0)
+  /** nudge 的单步长度：网格开启时用网格，否则一个采样 */
+  const nudgeStep = computed(() =>
+    snapGrid.value > 0 ? snapGrid.value : 1 / (buffer.value?.sampleRate ?? 48000)
+  )
+  const silenceSegmentCount = computed(() => segments.value.filter((s) => s.kind === 'silence').length)
 
   audioEngine.onEnded = () => {
     isPlaying.value = false
@@ -332,7 +416,29 @@ export const useEditorStore = defineStore('editor', () => {
       selection.start = 0
       selection.end = 0
     }
+    // 标记点跟随区间长度变化：被替换区间之后的点整体平移，其余裁到新时长
+    if (markers.value.length) {
+      const delta = (inserted[0]?.length ?? 0) - removeFrames
+      const sr = newBuf.sampleRate
+      const cutEnd = start + removeFrames
+      markers.value = sortMarkers(
+        markers.value.map((m) => {
+          const frame = m.time * sr
+          const next = frame >= cutEnd ? Math.max(0, frame + delta) : frame
+          return { ...m, time: clamp(next / sr, 0, newBuf.duration) }
+        })
+      )
+    }
+    invalidateAnalysis()
     syncLoopRange()
+  }
+
+  /** 音轨已变化：测量结果与语谱图不再对应当前数据，需要重新分析 */
+  function invalidateAnalysis(): void {
+    spectrogram.value = null
+    spectrogramProgress.value = 1
+    loudnessStats.value = null
+    segments.value = []
   }
 
   /** before / after 必须是专有拷贝；命令持有后不会被外部修改 */
@@ -407,6 +513,9 @@ export const useEditorStore = defineStore('editor', () => {
     chain.value = opts.chain ? sanitizeChain(opts.chain) : createDefaultChain()
     clipboard = null
     hasClipboard.value = false
+    markers.value = opts.markers ? sanitizeMarkers(opts.markers, decoded.duration) : []
+    noiseProfile.value = null
+    invalidateAnalysis()
     const dur = decoded.duration
     selection.start = clamp(opts.selection?.start ?? 0, 0, dur)
     selection.end = clamp(opts.selection?.end ?? 0, 0, dur)
@@ -433,6 +542,20 @@ export const useEditorStore = defineStore('editor', () => {
     }
     if (typeof state.volume === 'number' && Number.isFinite(state.volume)) {
       setVolume(clamp(state.volume, 0, 1))
+    }
+    if (typeof state.snapGrid === 'number' && Number.isFinite(state.snapGrid)) {
+      snapGrid.value = clamp(state.snapGrid, 0, 10)
+    }
+    if (state.viewMode === 'waveform' || state.viewMode === 'spectrum' || state.viewMode === 'both') {
+      viewMode.value = state.viewMode
+    }
+    if (state.markers !== undefined) {
+      markers.value = sanitizeMarkers(state.markers, duration.value)
+    }
+    if (state.noiseProfile !== undefined) {
+      noiseProfile.value = state.noiseProfile
+        ? sanitizeNoiseProfile(state.noiseProfile, buffer.value?.sampleRate ?? 48000)
+        : null
     }
     if (state.sidebarTab && VALID_TABS.includes(state.sidebarTab)) sidebarTab.value = state.sidebarTab
   }
@@ -614,41 +737,63 @@ export const useEditorStore = defineStore('editor', () => {
   }
 
   // ---- 选区 ----
-  /** 在 ±20ms 范围寻找最近的上升沿零交叉采样点 */
-  function findZeroCrossing(channel: Float32Array, target: number, radius: number): number {
+  /**
+   * 全声道零交叉吸附：在 ±20ms 内寻找「所有声道同时最接近静音且有上升沿」的采样点。
+   * 旧版只看声道 0，立体声两声道相位不同时会选到另一声道仍在振动的位置，产生咔嗒。
+   * 评分 = 各声道 |x[i-1]|+|x[i]| 均值 + 未过零声道惩罚 + 距离惩罚。
+   */
+  function findZeroCrossing(channels: Float32Array[], target: number, radius: number): number {
+    const len = channels[0]?.length ?? 0
+    if (len < 2) return target
     const lo = Math.max(1, target - radius)
-    const hi = Math.min(channel.length - 1, target + radius)
+    const hi = Math.min(len - 1, target + radius)
     let best = -1
-    let bestDist = Infinity
+    let bestScore = Infinity
     for (let i = lo; i <= hi; i++) {
-      if (channel[i - 1] <= 0 && channel[i] > 0) {
-        const dist = Math.abs(i - target)
-        if (dist < bestDist) {
-          bestDist = dist
-          best = i
-        }
+      let crossings = 0
+      let energy = 0
+      for (const ch of channels) {
+        if (ch[i - 1] <= 0 && ch[i] > 0) crossings++
+        energy += Math.abs(ch[i - 1]) + Math.abs(ch[i])
+      }
+      if (crossings === 0) continue
+      const score =
+        energy / channels.length +
+        (1 - crossings / channels.length) * 0.05 +
+        (Math.abs(i - target) / Math.max(1, radius)) * 0.01
+      if (score < bestScore) {
+        bestScore = score
+        best = i
       }
     }
     return best >= 0 ? best : target
   }
 
-  /** precise=true 时跳过 0.1s 网格吸附，用于面板内数值精确输入 */
+  /** 把时间对齐到当前网格；网格关闭时对齐到采样点 */
+  function snapValue(t: number): number {
+    const buf = buffer.value
+    if (snapGrid.value > 0) return snapTime(t, snapGrid.value)
+    const sr = buf?.sampleRate ?? 48000
+    return Math.round(t * sr) / sr
+  }
+
+  /** precise=true 时跳过网格吸附，用于面板内数值精确输入 */
   function setSelection(start: number, end: number, precise = false): void {
     if (!Number.isFinite(start) || !Number.isFinite(end)) return
     const dur = duration.value
-    let s = precise ? Math.min(start, end) : snapTime(Math.min(start, end))
-    let e = precise ? Math.max(start, end) : snapTime(Math.max(start, end))
+    let s = precise ? Math.min(start, end) : snapValue(Math.min(start, end))
+    let e = precise ? Math.max(start, end) : snapValue(Math.max(start, end))
     s = clamp(s, 0, dur)
     e = clamp(e, 0, dur)
     const buf = buffer.value
     if (zeroSnap.value && buf && buf.length > 2) {
       const sr = buf.sampleRate
       const radius = Math.round(sr * 0.02)
-      const ch = buf.getChannelData(0)
+      const channels = getAllChannels(buf)
       const plainS = s
       const plainE = e
-      const snappedS = findZeroCrossing(ch, Math.round(s * sr), radius) / sr
-      const snappedE = findZeroCrossing(ch, Math.round(e * sr), radius) / sr
+      const snappedS = findZeroCrossing(channels, Math.round(s * sr), radius) / sr
+      const snappedE = findZeroCrossing(channels, Math.round(e * sr), radius) / sr
       // 起止点各自独立吸附可能重合甚至翻转，吸附后必须重新校验顺序
       s = clamp(Math.min(snappedS, snappedE), 0, dur)
       e = clamp(Math.max(snappedS, snappedE), 0, dur)
@@ -661,6 +806,103 @@ export const useEditorStore = defineStore('editor', () => {
     selection.start = s
     selection.end = e
     syncLoopRange()
+  }
+
+  // ---- 标记点 / Cue ----
+  function addMarker(time?: number, label = ''): void {
+    const buf = buffer.value
+    if (!buf) return
+    const t = clamp(
+      time ?? (hasSelection.value ? selection.start : audioEngine.getPosition()),
+      0,
+      buf.duration
+    )
+    const next = sortMarkers([
+      ...markers.value,
+      { id: newMarkerId(), time: snapValue(t), label: label.trim() || `标记 ${markers.value.length + 1}` }
+    ])
+    markers.value = next
+  }
+
+  function removeMarker(id: string): void {
+    markers.value = markers.value.filter((m) => m.id !== id)
+  }
+
+  function renameMarker(id: string, label: string): void {
+    markers.value = markers.value.map((m) =>
+      m.id === id ? { ...m, label: label.slice(0, 80) } : m
+    )
+  }
+
+  function setMarkerTime(id: string, time: number): void {
+    if (!Number.isFinite(time)) return
+    markers.value = sortMarkers(
+      markers.value.map((m) => (m.id === id ? { ...m, time: clamp(time, 0, duration.value) } : m))
+    )
+  }
+
+  function clearMarkers(): void {
+    markers.value = []
+  }
+
+  function loadMarkers(raw: unknown): void {
+    markers.value = sanitizeMarkers(raw, duration.value)
+  }
+
+  function gotoMarker(id: string): void {
+    const m = markers.value.find((x) => x.id === id)
+    if (m) audioEngine.seek(m.time)
+  }
+
+  /** 把播放头到该标记点之间设为选区，方便按 Cue 逐段处理 */
+  function selectToMarker(id: string): void {
+    const m = markers.value.find((x) => x.id === id)
+    if (!m) return
+    const pos = audioEngine.getPosition()
+    setSelection(Math.min(pos, m.time), Math.max(pos, m.time), true)
+  }
+
+  function addMarkersFromTimes(times: number[], prefix: string): void {
+    const list = sanitizeMarkers(
+      times.map((time, i) => ({ id: newMarkerId(), time, label: `${prefix} ${i + 1}` })),
+      duration.value
+    )
+    markers.value = sortMarkers([...markers.value, ...list])
+  }
+
+  function jumpMarker(direction: -1 | 1): void {
+    const pos = audioEngine.getPosition()
+    const list = markers.value
+    if (!list.length) return
+    const target =
+      direction === 1
+        ? list.find((m) => m.time > pos + 1e-4)
+        : [...list].reverse().find((m) => m.time < pos - 1e-4)
+    if (target) audioEngine.seek(target.time)
+    else audioEngine.seek(direction === 1 ? list[list.length - 1].time : list[0].time)
+  }
+
+  // ---- 选区微调 ----
+  function nudge(direction: -1 | 1, mode: 'move' | 'start' | 'end' = 'move', scale = 1): void {
+    const buf = buffer.value
+    if (!buf) return
+    const step = nudgeStep.value * scale
+    const minLen = 1 / buf.sampleRate
+    if (!hasSelection.value) {
+      audioEngine.seek(clamp(audioEngine.getPosition() + direction * step, 0, buf.duration))
+      return
+    }
+    if (mode === 'move') {
+      const len = selection.end - selection.start
+      const ns = clamp(selection.start + direction * step, 0, Math.max(0, buf.duration - len))
+      setSelectionRaw(ns, ns + len)
+    } else if (mode === 'start') {
+      const ns = clamp(selection.start + direction * step, 0, selection.end - minLen)
+      setSelectionRaw(ns, selection.end)
+    } else {
+      const ne = clamp(selection.end + direction * step, selection.start + minLen, buf.duration)
+      setSelectionRaw(selection.start, ne)
+    }
   }
 
   function setSelectionRaw(start: number, end: number): void {
@@ -929,6 +1171,328 @@ export const useEditorStore = defineStore('editor', () => {
     )
   }
 
+  // ---- 测量 / 修复 / 自动化（均走 Worker，可取消、可撤销） ----
+
+  interface RegionResult {
+    channels: Float32Array[]
+    message: string
+  }
+
+  /** 统一的「取区间 → Worker 处理 → 提交一条音频命令」骨架 */
+  async function runRegionProcess(
+    busyType: BusyType,
+    label: string,
+    onlySelection: boolean,
+    task: (
+      channels: Float32Array[],
+      sampleRate: number,
+      signal: AbortSignal,
+      onProgress: (p: number) => void
+    ) => Promise<RegionResult>
+  ): Promise<void> {
+    const buf = buffer.value
+    if (!buf || busy.type) return
+    const sr = buf.sampleRate
+    const useSel = onlySelection && hasSelection.value
+    const s = useSel ? Math.floor(selection.start * sr) : 0
+    const e = useSel ? Math.floor(selection.end * sr) : buf.length
+    if (e - s < 64) {
+      toast.push('error', '处理区域过短')
+      return
+    }
+    const before = sliceChannels(getAllChannels(buf), s, e)
+    const controller = new AbortController()
+    processingController = controller
+    busy.type = busyType
+    busy.progress = 0
+    try {
+      const result = await task(before, sr, controller.signal, (p) => {
+        busy.progress = Math.round(clamp(p, 0, 1) * 100)
+      })
+      if (controller.signal.aborted) throw new DOMException('已取消', 'AbortError')
+      commitAudioCommand(makeAudioCommand(s, before, result.channels))
+      toast.push('success', result.message)
+    } catch (err) {
+      if (controller.signal.aborted || (err instanceof DOMException && err.name === 'AbortError')) {
+        toast.push('info', `已取消${label}`)
+      } else {
+        console.error(err)
+        toast.push('error', `${label}失败：${err instanceof Error ? err.message : '未知错误'}`)
+      }
+    } finally {
+      if (processingController === controller) processingController = null
+      busy.type = null
+      busy.progress = 0
+    }
+  }
+
+  /** 对全曲或选区做一次完整 BS.1770 测量，结果供测量面板展示与归一化使用 */
+  async function analyzeFullLoudness(range: 'all' | 'selection' = 'all'): Promise<void> {
+    const buf = buffer.value
+    if (!buf || busy.type) return
+    const sr = buf.sampleRate
+    const all = getAllChannels(buf)
+    const useSel = range === 'selection' && hasSelection.value
+    const channels = useSel
+      ? sliceChannels(all, Math.floor(selection.start * sr), Math.floor(selection.end * sr))
+      : all
+    if (!channels[0]?.length) {
+      toast.push('error', '测量范围为空')
+      return
+    }
+    const controller = new AbortController()
+    processingController = controller
+    busy.type = 'analyze'
+    busy.progress = 0
+    try {
+      const stats = await analyzeAudio(channels, sr, {
+        signal: controller.signal,
+        onProgress: (p) => {
+          busy.progress = Math.round(p * 100)
+        }
+      })
+      loudnessStats.value = stats
+      toast.push(
+        'success',
+        `测量完成：${Number.isFinite(stats.integratedLufs) ? stats.integratedLufs.toFixed(1) : '—'} LUFS-I · ${stats.truePeakDb.toFixed(1)} dBTP · ${stats.clipEvents} 处削波`,
+        5500
+      )
+    } catch (err) {
+      if (!(controller.signal.aborted || (err instanceof DOMException && err.name === 'AbortError'))) {
+        console.error(err)
+        toast.push('error', err instanceof Error ? err.message : '响度分析失败')
+      }
+    } finally {
+      if (processingController === controller) processingController = null
+      busy.type = null
+      busy.progress = 0
+    }
+  }
+
+  /** 按目标 LUFS 归一化；allowLimiter 时先补增益再用前瞻限制器守住真峰值上限 */
+  async function normalizeLufs(
+    targetLufs: number,
+    ceilingDbTp: number,
+    onlySelection: boolean,
+    allowLimiter: boolean
+  ): Promise<void> {
+    await runRegionProcess('repair', '响度归一化', onlySelection, async (channels, sr, signal, onProgress) => {
+      const stats = await analyzeAudio(channels, sr, {
+        signal,
+        onProgress: (p) => onProgress(p * 0.45)
+      })
+      if (!Number.isFinite(stats.integratedLufs)) throw new Error('该区域为静音，无法归一化')
+      const calc = normalizeGain(stats, targetLufs, ceilingDbTp, allowLimiter)
+      const gain = Math.pow(10, calc.gainDb / 20)
+      let out = channels.map((c) => {
+        const copy = c.slice()
+        for (let i = 0; i < copy.length; i++) copy[i] *= gain
+        return copy
+      })
+      onProgress(0.55)
+      let note = `增益 ${calc.gainDb >= 0 ? '+' : ''}${calc.gainDb.toFixed(1)} dB`
+      if (allowLimiter) {
+        const lim = await limitAudio(out, sr, ceilingDbTp, signal, (p) => onProgress(0.55 + p * 0.45))
+        out = lim.channels
+        note += `，限制器最大衰减 ${lim.maxReductionDb.toFixed(1)} dB`
+      } else {
+        onProgress(1)
+        if (calc.limitedByCeiling) note += '（受真峰值上限约束，未达到目标响度，可勾选限制器）'
+      }
+      return { channels: out, message: `已归一化至 ${targetLufs} LUFS：${note}` }
+    })
+  }
+
+  /** 从选区（或开头 0.5s）采样噪声指纹，存进工程文件 */
+  async function captureNoise(): Promise<void> {
+    const buf = buffer.value
+    if (!buf || busy.type) return
+    const sr = buf.sampleRate
+    let from = 0
+    let to = Math.min(buf.length, Math.round(sr * 0.5))
+    if (hasSelection.value) {
+      from = Math.floor(selection.start * sr)
+      to = Math.floor(selection.end * sr)
+    }
+    if (to - from < 2048) {
+      from = 0
+      to = Math.min(buf.length, Math.round(sr * 0.5))
+    }
+    if (to - from < 2048) {
+      toast.push('error', '音频过短，无法采样噪声指纹')
+      return
+    }
+    const region = sliceChannels(getAllChannels(buf), from, to)
+    const controller = new AbortController()
+    processingController = controller
+    busy.type = 'analyze'
+    busy.progress = 0
+    try {
+      const profile = await captureNoiseProfile(region, sr, 0, -1, controller.signal, (p) => {
+        busy.progress = Math.round(p * 100)
+      })
+      noiseProfile.value = profile
+      toast.push(
+        'success',
+        `已采样 ${(from / sr).toFixed(2)}–${(to / sr).toFixed(2)}s 的 ${NOISE_BANDS} 段噪声指纹（请框选只有底噪的片段）`
+      )
+    } catch (err) {
+      if (!(controller.signal.aborted || (err instanceof DOMException && err.name === 'AbortError'))) {
+        toast.push('error', err instanceof Error ? err.message : '噪声采样失败')
+      }
+    } finally {
+      if (processingController === controller) processingController = null
+      busy.type = null
+      busy.progress = 0
+    }
+  }
+
+  async function applyDenoise(amountDb: number, onlySelection: boolean): Promise<void> {
+    await runRegionProcess('repair', '噪声指纹降噪', onlySelection, async (channels, sr, signal, onProgress) => {
+      const profile = noiseProfile.value
+      if (!profile) throw new Error('请先在「修复」面板采样噪声指纹')
+      const out = await denoiseAudio(channels, sr, profile, amountDb, signal, onProgress)
+      return { channels: out, message: `已完成谱减降噪（强度 ${amountDb.toFixed(0)} dB）` }
+    })
+  }
+
+  async function applyDeclick(sensitivity: number, onlySelection: boolean): Promise<void> {
+    await runRegionProcess('repair', '去咔嗒', onlySelection, async (channels, sr, signal, onProgress) => {
+      const r = await declickAudio(channels, sr, sensitivity, signal, onProgress)
+      return { channels: r.channels, message: `已修复 ${r.clicks} 处脉冲（咔嗒）` }
+    })
+  }
+
+  async function applyLimiter(ceilingDb: number, onlySelection: boolean): Promise<void> {
+    await runRegionProcess('repair', '真峰值限制', onlySelection, async (channels, sr, signal, onProgress) => {
+      const r = await limitAudio(channels, sr, ceilingDb, signal, onProgress)
+      return {
+        channels: r.channels,
+        message: `已限制到 ${ceilingDb.toFixed(1)} dBTP（最大衰减 ${r.maxReductionDb.toFixed(1)} dB）`
+      }
+    })
+  }
+
+  /** 独立变调：WSOLA 保持时长 + 重采样改变音调 */
+  async function pitchShiftSemitones(semitones: number, onlySelection: boolean): Promise<void> {
+    const semi = clamp(semitones, -24, 24)
+    if (Math.abs(semi) < 0.01) {
+      toast.push('info', '变调为 0 半音，无需处理')
+      return
+    }
+    await runRegionProcess('repair', '独立变调', onlySelection, async (channels, sr, signal, onProgress) => {
+      const out = await shiftPitch(channels, sr, semi, signal, onProgress)
+      return { channels: out, message: `已变调 ${semi > 0 ? '+' : ''}${semi.toFixed(1)} 半音（时长保持不变）` }
+    })
+  }
+
+  /** 静音检测分段：结果写入 segments，可生成 Cue 或批量移除静音 */
+  async function detectSilenceSegments(options: SilencePresetOptions): Promise<void> {
+    const buf = buffer.value
+    if (!buf || busy.type) return
+    const controller = new AbortController()
+    processingController = controller
+    busy.type = 'analyze'
+    busy.progress = 0
+    try {
+      const list = await detectSilence(getAllChannels(buf), buf.sampleRate, options, controller.signal)
+      segments.value = list
+      const silent = list.filter((s) => s.kind === 'silence')
+      toast.push('success', `检测到 ${silent.length} 段静音、${list.length - silent.length} 段有声内容`)
+    } catch (err) {
+      if (!(controller.signal.aborted || (err instanceof DOMException && err.name === 'AbortError'))) {
+        toast.push('error', err instanceof Error ? err.message : '静音检测失败')
+      }
+    } finally {
+      if (processingController === controller) processingController = null
+      busy.type = null
+      busy.progress = 0
+    }
+  }
+
+  function segmentsToMarkers(): void {
+    const sounds = segments.value.filter((s) => s.kind === 'sound')
+    if (!sounds.length) {
+      toast.push('info', '请先执行静音检测')
+      return
+    }
+    addMarkersFromTimes(sounds.map((s) => s.start), '段落')
+    toast.push('success', `已在 ${sounds.length} 个有声段落起点添加标记`)
+  }
+
+  /** 一次性移除所有静音段：整轨替换，因此历史需保留原音轨（与 trim 同理） */
+  async function removeSilences(options: SilencePresetOptions): Promise<void> {
+    const buf = buffer.value
+    if (!buf || busy.type) return
+    const sr = buf.sampleRate
+    const controller = new AbortController()
+    processingController = controller
+    busy.type = 'repair'
+    busy.progress = 0
+    try {
+      const all = getAllChannels(buf)
+      const list = await detectSilence(all, sr, options, controller.signal)
+      const sounds = list.filter((s) => s.kind === 'sound')
+      if (!sounds.length) {
+        toast.push('info', '整条音轨都被判定为静音，未做修改')
+        return
+      }
+      const ranges = sounds.map((s) => ({
+        from: clamp(Math.floor(s.start * sr), 0, buf.length),
+        to: clamp(Math.ceil(s.end * sr), 0, buf.length)
+      }))
+      const total = ranges.reduce((n, r) => n + Math.max(0, r.to - r.from), 0)
+      if (total < 1) {
+        toast.push('info', '没有可保留的有声内容')
+        return
+      }
+      const before = sliceChannels(all, 0, buf.length)
+      const after = all.map(() => new Float32Array(total))
+      let pos = 0
+      for (const r of ranges) {
+        if (r.to <= r.from) continue
+        for (let c = 0; c < all.length; c++) {
+          after[c].set(all[c].subarray(r.from, r.to), pos)
+        }
+        pos += r.to - r.from
+      }
+      commitAudioCommand(makeAudioCommand(0, before, after))
+      const removed = (buf.duration - total / sr).toFixed(1)
+      toast.push('success', `已移除 ${list.length - sounds.length} 段静音，共缩短 ${removed}s（可 Ctrl+Z 还原）`)
+    } catch (err) {
+      if (!(controller.signal.aborted || (err instanceof DOMException && err.name === 'AbortError'))) {
+        console.error(err)
+        toast.push('error', err instanceof Error ? err.message : '静音移除失败')
+      }
+    } finally {
+      if (processingController === controller) processingController = null
+      busy.type = null
+      busy.progress = 0
+    }
+  }
+
+  // ---- 分析视图状态 ----
+  function setSnapGrid(value: number): void {
+    snapGrid.value = Number.isFinite(value) ? clamp(value, 0, 10) : 0.1
+  }
+
+  function setViewMode(mode: WaveViewMode): void {
+    viewMode.value = mode
+  }
+
+  function setSpectrogram(spec: Spectrogram | null, progress = 1): void {
+    spectrogram.value = spec
+    spectrogramProgress.value = progress
+  }
+
+  function setNoiseProfile(profile: NoiseProfile | null): void {
+    noiseProfile.value = profile
+  }
+
+  function clearLoudnessStats(): void {
+    loudnessStats.value = null
+  }
+
   // ---- 变速（WSOLA Worker） ----
   async function timeStretch(ratio: number, keepPitch: boolean, onlySelection: boolean): Promise<void> {
     const buf = buffer.value
@@ -1104,6 +1668,14 @@ export const useEditorStore = defineStore('editor', () => {
     scrollX,
     vGain,
     zeroSnap,
+    snapGrid,
+    viewMode,
+    spectrogram,
+    spectrogramProgress,
+    markers,
+    noiseProfile,
+    segments,
+    loudnessStats,
     hasClipboard,
     pendingView,
     isPlaying,
@@ -1118,12 +1690,26 @@ export const useEditorStore = defineStore('editor', () => {
     hasSelection,
     canUndo,
     canRedo,
+    nudgeStep,
+    silenceSegmentCount,
     loadFile,
     loadDecodedBuffer,
     applyViewState,
     setSelection,
     setSelectionRaw,
+    snapValue,
+    nudge,
     clearSelection,
+    addMarker,
+    removeMarker,
+    renameMarker,
+    setMarkerTime,
+    clearMarkers,
+    loadMarkers,
+    gotoMarker,
+    selectToMarker,
+    jumpMarker,
+    segmentsToMarkers,
     trim,
     deleteRegion,
     silence,
@@ -1152,6 +1738,20 @@ export const useEditorStore = defineStore('editor', () => {
     audition,
     timeStretch,
     mergeClips,
+    analyzeFullLoudness,
+    normalizeLufs,
+    captureNoise,
+    applyDenoise,
+    applyDeclick,
+    applyLimiter,
+    pitchShiftSemitones,
+    detectSilenceSegments,
+    removeSilences,
+    setSnapGrid,
+    setViewMode,
+    setSpectrogram,
+    setNoiseProfile,
+    clearLoudnessStats,
     undo,
     redo,
     togglePlay,

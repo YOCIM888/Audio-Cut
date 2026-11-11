@@ -3,7 +3,23 @@
  *  - time-stretch：WSOLA 变速不变调（或纯重采样变速）
  *  - merge：多轨合并，支持静音间隔 / 等功率交叉淡化
  *  - gate：门限降噪（包络跟随 + 平滑增益）
+ *  - analyze：BS.1770 LUFS / RMS / 真峰值 / 削波
+ *  - spectrogram / noise-profile / denoise / declick / silence / limiter
+ *  - pitch-shift：独立变调（保持时长）
+ *
+ * 所有分析函数来自 src/audio 下的纯模块，与主线程、Node 断言共用同一份实现。
  */
+import { analyzeLoudness } from '../audio/loudness'
+import {
+  computeSpectrogram,
+  estimateNoiseProfile,
+  spectralDenoise,
+  declick,
+  detectSegments,
+  limitTruePeak,
+  type NoiseProfile,
+  type SilenceOptions
+} from '../audio/spectral'
 
 const scope = self as unknown as Worker
 
@@ -30,7 +46,61 @@ interface GateRequest {
   thresholdDb: number
 }
 
-type Request = TimeStretchRequest | MergeRequest | GateRequest
+interface ChannelsRequest {
+  channels: Float32Array[]
+  sampleRate: number
+}
+
+interface AnalyzeRequest extends ChannelsRequest {
+  type: 'analyze'
+  maxHistoryPoints?: number
+}
+interface SpectrogramRequest extends ChannelsRequest {
+  type: 'spectrogram'
+  fftSize: number
+  maxColumns: number
+  minDb: number
+  maxDb: number
+}
+interface NoiseProfileRequest extends ChannelsRequest {
+  type: 'noise-profile'
+  startFrame: number
+  endFrame: number
+}
+interface DenoiseRequest extends ChannelsRequest {
+  type: 'denoise'
+  profile: NoiseProfile
+  amountDb: number
+}
+interface DeclickRequest extends ChannelsRequest {
+  type: 'declick'
+  sensitivity: number
+}
+interface SilenceRequest extends ChannelsRequest {
+  type: 'silence'
+  options: SilenceOptions
+}
+interface LimiterRequest extends ChannelsRequest {
+  type: 'limiter'
+  ceilingDb: number
+}
+interface PitchShiftRequest extends ChannelsRequest {
+  type: 'pitch-shift'
+  semitones: number
+}
+
+type Request =
+  | TimeStretchRequest
+  | MergeRequest
+  | GateRequest
+  | AnalyzeRequest
+  | SpectrogramRequest
+  | NoiseProfileRequest
+  | DenoiseRequest
+  | DeclickRequest
+  | SilenceRequest
+  | LimiterRequest
+  | PitchShiftRequest
 
 function postProgress(progress: number): void {
   scope.postMessage({ type: 'progress', progress })
@@ -209,21 +279,112 @@ function gate(channels: Float32Array[], sampleRate: number, thresholdDb: number)
   return out
 }
 
+/**
+ * 独立变调（保持时长）：先用 WSOLA 以 1/p 倍速把音轨拉长且不变调，
+ * 再以 p 倍速重采样回原长，此时音调变为 p 倍而总时长不变。
+ * 相比纯重采样，不会把播客变成「花栗鼠」或拖慢语速。
+ */
+function pitchShift(channels: Float32Array[], sampleRate: number, semitones: number): Float32Array[] {
+  const semi = Math.max(-24, Math.min(24, semitones))
+  if (Math.abs(semi) < 0.001) return channels.map((c) => c.slice())
+  const p = Math.pow(2, semi / 12)
+  const stretched = wsola(channels, sampleRate, 1 / p)
+  return resampleFast(stretched, p)
+}
+
+function postDone(
+  data: unknown,
+  channels?: Float32Array[],
+  extraTransfer: Transferable[] = []
+): void {
+  postProgress(100)
+  const transfer = channels && channels.length ? channels.map((c) => c.buffer) : extraTransfer
+  scope.postMessage({ type: 'done', data }, transfer)
+}
+
 scope.onmessage = (e: MessageEvent) => {
   try {
     const msg = e.data as Request
-    let channels: Float32Array[]
-    if (msg.type === 'time-stretch') {
-      channels = msg.keepPitch
-        ? wsola(msg.channels, msg.sampleRate, msg.ratio)
-        : resampleFast(msg.channels, msg.ratio)
-    } else if (msg.type === 'gate') {
-      channels = gate(msg.channels, msg.sampleRate, msg.thresholdDb)
-    } else {
-      channels = merge(msg.clips, msg.gapSeconds, msg.crossfadeSeconds, msg.sampleRate)
+    const progress = (p: number) => postProgress(Math.min(99, Math.round(p * 100)))
+    switch (msg.type) {
+      case 'time-stretch': {
+        const ch = msg.keepPitch
+          ? wsola(msg.channels, msg.sampleRate, msg.ratio)
+          : resampleFast(msg.channels, msg.ratio)
+        postDone({ channels: ch }, ch)
+        break
+      }
+      case 'gate': {
+        const ch = gate(msg.channels, msg.sampleRate, msg.thresholdDb)
+        postDone({ channels: ch }, ch)
+        break
+      }
+      case 'analyze':
+        postDone({
+          stats: analyzeLoudness(msg.channels, msg.sampleRate, {
+            onProgress: progress,
+            maxHistoryPoints: msg.maxHistoryPoints
+          })
+        })
+        break
+      case 'spectrogram': {
+        const spec = computeSpectrogram(msg.channels, msg.sampleRate, {
+          fftSize: msg.fftSize,
+          maxColumns: msg.maxColumns,
+          minDb: msg.minDb,
+          maxDb: msg.maxDb,
+          onProgress: progress
+        })
+        // 直接转移 Uint8Array 的底层 buffer，避免大语谱图被复制
+        postDone({ spectrogram: spec }, undefined, [spec.data.buffer])
+        break
+      }
+      case 'noise-profile':
+        postDone({
+          profile: estimateNoiseProfile(
+            msg.channels,
+            msg.sampleRate,
+            msg.startFrame,
+            msg.endFrame,
+            progress
+          )
+        })
+        break
+      case 'denoise': {
+        const ch = spectralDenoise(
+          msg.channels,
+          msg.sampleRate,
+          msg.profile,
+          msg.amountDb,
+          progress
+        )
+        postDone({ channels: ch }, ch)
+        break
+      }
+      case 'declick': {
+        const r = declick(msg.channels, msg.sampleRate, msg.sensitivity, progress)
+        postDone({ channels: r.channels, clicks: r.clicks }, r.channels)
+        break
+      }
+      case 'silence':
+        postDone({ segments: detectSegments(msg.channels, msg.sampleRate, msg.options) })
+        break
+      case 'limiter': {
+        const r = limitTruePeak(msg.channels, msg.sampleRate, msg.ceilingDb, progress)
+        postDone({ channels: r.channels, maxReductionDb: r.maxReductionDb, truePeakDb: r.truePeakDb }, r.channels)
+        break
+      }
+      case 'pitch-shift': {
+        const ch = pitchShift(msg.channels, msg.sampleRate, msg.semitones)
+        postDone({ channels: ch }, ch)
+        break
+      }
+      case 'merge': {
+        const ch = merge(msg.clips, msg.gapSeconds, msg.crossfadeSeconds, msg.sampleRate)
+        postDone({ channels: ch }, ch)
+        break
+      }
     }
-    postProgress(100)
-    scope.postMessage({ type: 'done', data: { channels } }, channels.map((c) => c.buffer))
   } catch (err) {
     scope.postMessage({
       type: 'error',

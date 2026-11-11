@@ -9,6 +9,8 @@ import {
   type EffectKind,
   type ParamSpec
 } from '../audio/effect-chain'
+import { eqBandsFromChain } from '../audio/eq-response'
+import EqCurve from './EqCurve.vue'
 
 interface Card {
   id: string
@@ -23,7 +25,10 @@ interface Card {
 const editor = useEditorStore()
 
 const addKind = ref<EffectKind>('highpass')
+const selectedEffectId = ref<string | null>(null)
 const busy = computed(() => editor.busy.type !== null)
+const sampleRate = computed(() => editor.buffer?.sampleRate ?? 48000)
+const eqBandCount = computed(() => eqBandsFromChain(editor.chain.nodes).length)
 const cards = computed<Card[]>(() =>
   editor.chain.nodes.map((node, index) => ({
     id: node.id,
@@ -63,6 +68,14 @@ function onScope(e: Event): void {
 
 function addEffect(): void {
   editor.addEffect(addKind.value)
+}
+
+function onEqUpdate(id: string, patch: Record<string, number>): void {
+  editor.updateEffect(id, patch)
+}
+
+function onEqSelect(id: string): void {
+  selectedEffectId.value = id
 }
 
 // 「按住听原声」：瞬时旁路，松开恢复，不污染撤销栈
@@ -159,13 +172,35 @@ function releaseOriginal(): void {
       </div>
     </div>
 
+    <!-- 多段 EQ 曲线 -->
+    <div v-if="eqBandCount" class="panel p-2.5 space-y-1.5">
+      <div class="flex items-center justify-between">
+        <label class="field-label !mb-0">EQ 频响曲线（{{ eqBandCount }} 段）</label>
+        <span class="text-[9px] text-slate-600">拖动圆点调频率 / 增益</span>
+      </div>
+      <EqCurve
+        :nodes="editor.chain.nodes"
+        :sample-rate="sampleRate"
+        :selected-id="selectedEffectId"
+        @update="onEqUpdate"
+        @select="onEqSelect"
+      />
+      <p class="text-[10px] text-slate-600 leading-snug">
+        黄色为高切 / 低切（只调截止频率），青色为架式与参数 EQ。改动直接写入链节点，实时试听、可撤销。
+      </p>
+    </div>
+
     <!-- 效果链节点 -->
     <div class="space-y-2">
       <div
         v-for="card in cards"
         :key="card.id"
         class="panel p-2.5 space-y-2"
-        :class="{ 'opacity-50': !card.enabled }"
+        :class="{
+          'opacity-50': !card.enabled,
+          'border-neon/60': selectedEffectId === card.id
+        }"
+        @click="selectedEffectId = card.id"
       >
         <div class="flex items-center gap-1.5">
           <input

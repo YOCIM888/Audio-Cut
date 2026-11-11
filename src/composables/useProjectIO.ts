@@ -16,13 +16,16 @@ import { useEditorStore, type SidebarTab } from '../stores/editor'
 import { useToastStore } from '../stores/toast'
 import { audioEngine } from '../audio/engine'
 import { cloneChain, sanitizeChain, type EffectChainState } from '../audio/effect-chain'
+import type { Marker } from '../audio/markers'
+import type { NoiseProfile } from '../audio/spectral'
 import { channelsToAudioBuffer, getAllChannels } from '../utils/audio-utils'
 import { decodeWavBlob, encodeFloatWavBlob } from '../utils/wav-blob'
 import { createZip, readZip, type ZipInput } from '../utils/zip'
 import { clearSourceFile, getSourceFile, setSourceFile } from '../utils/source-file'
 
 const PROJECT_APP = 'yocim-audio-cut'
-const PROJECT_VERSION = 3
+/** v4 起工程包额外保存标记点、吸附精度、频谱视图模式与噪声指纹 */
+const PROJECT_VERSION = 4
 const AUDIO_ENTRY = 'audio.wav'
 const MANIFEST_ENTRY = 'project.json'
 
@@ -42,6 +45,10 @@ interface ProjectManifest {
   volume: number
   sidebarTab: string
   chain: EffectChainState
+  markers: Marker[]
+  snapGrid: number
+  viewMode: 'waveform' | 'spectrum' | 'both'
+  noiseProfile: NoiseProfile | null
   audio: { file: string; encoding: 'wav-f32' }
   source: { file: string; name: string; bytes: number } | null
 }
@@ -140,6 +147,10 @@ export function useProjectIO() {
         volume: editor.volume,
         sidebarTab: editor.sidebarTab,
         chain: cloneChain(editor.chain),
+        markers: editor.markers.map((m) => ({ ...m })),
+        snapGrid: editor.snapGrid,
+        viewMode: editor.viewMode,
+        noiseProfile: editor.noiseProfile,
         audio: { file: AUDIO_ENTRY, encoding: 'wav-f32' },
         source: src && sourceEntry ? { file: sourceEntry, name: src.name, bytes: src.blob.size } : null
       }
@@ -196,7 +207,11 @@ export function useProjectIO() {
       zeroSnap: data.zeroSnap,
       isLooping: data.isLooping,
       volume: data.volume,
-      sidebarTab: data.sidebarTab as SidebarTab | undefined
+      sidebarTab: data.sidebarTab as SidebarTab | undefined,
+      snapGrid: data.snapGrid,
+      viewMode: data.viewMode,
+      markers: data.markers,
+      noiseProfile: data.noiseProfile
     })
 
     const srcEntry = data.source?.file ? findEntry(entries, data.source.file) : undefined

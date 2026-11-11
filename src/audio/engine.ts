@@ -8,6 +8,7 @@
  */
 import { chainActive, enabledNodes, type EffectChainState } from './effect-chain'
 import { EffectGraph, ensureGateWorklet } from './effect-graph'
+import { createRealtimeMeter, type MeterHandle, type MeterMode, type MeterStats } from './meter'
 
 export interface LoopRange {
   start: number
@@ -20,6 +21,7 @@ class AudioEngine {
   private dryGain: GainNode | null = null
   private wetGain: GainNode | null = null
   private fxInput: GainNode | null = null
+  private meterTap: GainNode | null = null
   private graph: EffectGraph | null = null
   private source: AudioBufferSourceNode | null = null
   private buffer: AudioBuffer | null = null
@@ -35,6 +37,11 @@ class AudioEngine {
   private mixTimer: number | null = null
   private gateWorkletHooked = false
   private lastWet: boolean | null = null
+
+  private meterListeners = new Set<(s: MeterStats) => void>()
+  private meterHandle: MeterHandle | null = null
+  private meterMode: MeterMode = 'unavailable'
+  private meterAttaching = false
 
   /** 自然播放结束回调（手动 stop 不触发） */
   onEnded: (() => void) | null = null
@@ -59,10 +66,17 @@ class AudioEngine {
       this.fxInput = ctx.createGain()
       this.fxInput.gain.value = 1
 
+      // 测量抽头取主音量之前的干/湿汇流，调监听音量不影响电平读数
+      this.meterTap = ctx.createGain()
+      this.meterTap.gain.value = 1
+      this.dryGain.connect(this.meterTap)
+      this.wetGain.connect(this.meterTap)
+
       this.graph = new EffectGraph(ctx, this.fxInput, this.wetGain)
       this.graph.sync(this.effectState ? enabledNodes(this.effectState) : [])
       this.prepareGateWorklet()
       this.applyMix()
+      void this.syncMeter()
     }
     if (this.ctx.state === 'suspended') void this.ctx.resume()
     return this.ctx
@@ -74,6 +88,51 @@ class AudioEngine {
 
   get duration(): number {
     return this.buffer?.duration ?? 0
+  }
+
+  /** 订阅实时电平表；第一个订阅者会惰性创建 AudioWorklet，最后一个解除时释放 */
+  addMeterListener(fn: (s: MeterStats) => void): () => void {
+    this.meterListeners.add(fn)
+    void this.syncMeter()
+    return () => {
+      this.meterListeners.delete(fn)
+      void this.syncMeter()
+    }
+  }
+
+  getMeterMode(): MeterMode {
+    return this.meterMode
+  }
+
+  resetMeter(): void {
+    this.meterHandle?.reset()
+  }
+
+  private async syncMeter(): Promise<void> {
+    if (!this.ctx || !this.meterTap) return
+    if (this.meterListeners.size === 0) {
+      this.meterHandle?.dispose()
+      this.meterHandle = null
+      this.meterMode = 'unavailable'
+      return
+    }
+    if (this.meterHandle || this.meterAttaching) return
+    this.meterAttaching = true
+    try {
+      const handle = await createRealtimeMeter(this.ctx, this.meterTap, (s) => {
+        for (const fn of this.meterListeners) fn(s)
+      })
+      // 订阅可能在异步注册期间被全部移除
+      if (this.meterListeners.size === 0) {
+        handle.dispose()
+        this.meterMode = 'unavailable'
+      } else {
+        this.meterHandle = handle
+        this.meterMode = handle.mode
+      }
+    } finally {
+      this.meterAttaching = false
+    }
   }
 
   setBuffer(buffer: AudioBuffer | null): void {

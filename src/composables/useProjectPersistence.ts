@@ -109,6 +109,10 @@ export function useProjectPersistence() {
       volume: editor.volume,
       sidebarTab: editor.sidebarTab,
       chain: cloneChain(editor.chain),
+      markers: editor.markers.map((m) => ({ ...m })),
+      snapGrid: editor.snapGrid,
+      viewMode: editor.viewMode,
+      noiseProfile: editor.noiseProfile ? { ...editor.noiseProfile, bands: [...editor.noiseProfile.bands] } : null,
       audioKey,
       audioBytes,
       audioOversize: oversize,
@@ -278,7 +282,11 @@ export function useProjectPersistence() {
         zeroSnap: meta.zeroSnap,
         isLooping: meta.isLooping,
         volume: meta.volume,
-        sidebarTab: meta.sidebarTab as SidebarTab | undefined
+        sidebarTab: meta.sidebarTab as SidebarTab | undefined,
+        snapGrid: meta.snapGrid,
+        viewMode: meta.viewMode,
+        markers: meta.markers,
+        noiseProfile: meta.noiseProfile
       })
       const src = await readSource()
       setSourceFile(src ? { blob: src.blob, name: src.name } : null, false)
@@ -392,7 +400,11 @@ export function useProjectPersistence() {
         editor.isLooping,
         editor.volume,
         editor.sidebarTab,
-        editor.chain
+        editor.chain,
+        editor.markers,
+        editor.snapGrid,
+        editor.viewMode,
+        editor.noiseProfile
       ],
       () => {
         if (!suppress && !paused.value && status.value !== 'disabled') scheduleMeta()

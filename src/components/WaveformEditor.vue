@@ -1,17 +1,27 @@
 <script setup lang="ts">
 /**
  * 波形编辑器：
- *  - 双 Canvas：底层波形+时间标尺（按需重绘），上层选区+播放头（脏标记按需重绘）
+ *  - 双 Canvas：底层波形 / 语谱图 + 时间标尺（按需重绘），上层选区 + 播放头（脏标记按需重绘）
  *  - 峰值金字塔由 Worker 分块构建，构建期间逐块渐进显示
- *  - 支持滚轮缩放（光标锚点）、横向滚动、0.1s 吸附框选、选区边缘拖拽、
+ *  - 波形 / 频谱 / 叠加三种视图共用同一条时间轴，标记点、静音段与吸附网格同步绘制
+ *  - 支持滚轮缩放（光标锚点）、横向滚动、吸附框选、选区边缘拖拽、
  *    Shift 拖动选区、点击定位播放头、播放自动跟随
  */
-import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { useEditorStore } from '../stores/editor'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { useEditorStore, SNAP_GRIDS, type WaveViewMode } from '../stores/editor'
 import { audioEngine } from '../audio/engine'
 import { clamp, formatTime } from '../utils/audio-utils'
+import type { Spectrogram } from '../audio/spectral'
 
 const editor = useEditorStore()
+const viewModes: { key: WaveViewMode; label: string }[] = [
+  { key: 'waveform', label: '波形' },
+  { key: 'spectrum', label: '频谱' },
+  { key: 'both', label: '叠加' }
+]
+const gridLabel = computed(
+  () => SNAP_GRIDS.find((g) => g.value === editor.snapGrid)?.label ?? `${editor.snapGrid}s`
+)
 
 const wrap = ref<HTMLDivElement | null>(null)
 const baseCanvas = ref<HTMLCanvasElement | null>(null)
@@ -39,10 +49,78 @@ let downX = 0
 /** 悬停读数位置（CSS px），普通变量，不进入响应式 */
 let hoverX: number | null = null
 
+/** 语谱图离屏位图缓存：只在 spec 变化时重建，缩放/滚动时只做 drawImage 裁剪 */
+let specBitmap: HTMLCanvasElement | null = null
+let specSource: Spectrogram | null = null
+const SPEC_HEIGHT = 256
+const SPEC_MIN_FREQ = 20
+const palette = buildPalette()
+
+function buildPalette(): Uint8ClampedArray {
+  // 深蓝 → 青 → 黄 → 白，低能量更暗，便于看清语音谐波结构
+  const stops: [number, number, number, number][] = [
+    [0, 4, 8, 22],
+    [0.18, 12, 34, 78],
+    [0.4, 16, 120, 148],
+    [0.62, 34, 211, 190],
+    [0.8, 250, 204, 21],
+    [1, 255, 250, 224]
+  ]
+  const out = new Uint8ClampedArray(256 * 4)
+  for (let i = 0; i < 256; i++) {
+    const t = i / 255
+    let k = 0
+    while (k < stops.length - 2 && t > stops[k + 1][0]) k++
+    const a = stops[k]
+    const b = stops[k + 1]
+    const f = (t - a[0]) / Math.max(1e-6, b[0] - a[0])
+    out[i * 4] = a[1] + (b[1] - a[1]) * f
+    out[i * 4 + 1] = a[2] + (b[2] - a[2]) * f
+    out[i * 4 + 2] = a[3] + (b[3] - a[3]) * f
+    out[i * 4 + 3] = 255
+  }
+  return out
+}
+
+function buildSpecBitmap(spec: Spectrogram): HTMLCanvasElement {
+  const bmp = document.createElement('canvas')
+  bmp.width = spec.columns
+  bmp.height = SPEC_HEIGHT
+  const c = bmp.getContext('2d')
+  if (!c) return bmp
+  const img = c.createImageData(spec.columns, SPEC_HEIGHT)
+  const maxFreq = Math.min(spec.sampleRate / 2, 24000)
+  const logRatio = Math.log(maxFreq / SPEC_MIN_FREQ)
+  // 纵向对数频率轴：第 0 行 = 高频，最后一行 = 低频
+  const rowBins = new Int32Array(SPEC_HEIGHT)
+  for (let y = 0; y < SPEC_HEIGHT; y++) {
+    const f = maxFreq * Math.exp(-(y / (SPEC_HEIGHT - 1)) * logRatio)
+    rowBins[y] = clamp(Math.round((f / (spec.sampleRate / 2)) * (spec.bins - 1)), 0, spec.bins - 1)
+  }
+  for (let x = 0; x < spec.columns; x++) {
+    const base = x * spec.bins
+    for (let y = 0; y < SPEC_HEIGHT; y++) {
+      const v = spec.data[base + rowBins[y]]
+      const o = (y * spec.columns + x) * 4
+      const p = v * 4
+      img.data[o] = palette[p]
+      img.data[o + 1] = palette[p + 1]
+      img.data[o + 2] = palette[p + 2]
+      img.data[o + 3] = 255
+    }
+  }
+  c.putImageData(img, 0, 0)
+  return bmp
+}
+
 const timeToX = (t: number) => t * editor.zoom - editor.scrollX
 const xToTime = (x: number) => (x + editor.scrollX) / editor.zoom
 const maxScroll = () => Math.max(0, editor.duration * editor.zoom - cssW)
-const snap = (t: number) => clamp(Math.round(t * 10) / 10, 0, editor.duration)
+/** 拖动整段选区时的吸附：与「标记」页的吸附精度保持一致，0 = 采样级不吸附 */
+function snap(t: number): number {
+  const g = editor.snapGrid
+  return clamp(g > 0 ? Math.round(t / g) * g : t, 0, editor.duration)
+}
 
 function clampScroll(): void {
   editor.scrollX = clamp(editor.scrollX, 0, maxScroll())
@@ -84,7 +162,12 @@ function drawBase(): void {
     ctx.fillText('点击顶部「导入音频」或将音频文件拖拽到此处', cssW / 2, cssH / 2)
     return
   }
-  drawWaveform(ctx)
+  drawSnapGrid(ctx)
+  drawSpectrogram(ctx)
+  if (editor.viewMode !== 'spectrum') drawWaveform(ctx)
+  drawSilenceSegments(ctx)
+  drawMarkers(ctx)
+
   const cache = editor.peakCache
   if (cache && !cache.complete) {
     const label = `波形构建中 ${Math.round(cache.progress * 100)}%`
@@ -96,6 +179,152 @@ function drawBase(): void {
     ctx.fillStyle = '#67e8f9'
     ctx.fillText(label, 15, cssH - 11)
   }
+  if (editor.viewMode !== 'waveform' && !editor.spectrogram) {
+    const label = '尚未生成频谱：到「测量」页点击「生成频谱图」'
+    ctx.font = '11px ui-monospace, monospace'
+    ctx.textAlign = 'center'
+    const w = ctx.measureText(label).width + 20
+    ctx.fillStyle = 'rgba(4,6,12,0.88)'
+    ctx.fillRect(cssW / 2 - w / 2, cssH / 2 - 13, w, 24)
+    ctx.fillStyle = '#fbbf24'
+    ctx.fillText(label, cssW / 2, cssH / 2 + 3)
+  }
+}
+
+/** 吸附网格：只在间距足够宽时绘制，避免放大成一片竖线 */
+function drawSnapGrid(ctx: CanvasRenderingContext2D): void {
+  const grid = editor.snapGrid
+  if (!grid || grid * editor.zoom < 9) return
+  const t0 = Math.max(0, Math.floor(xToTime(0) / grid) * grid)
+  const t1 = Math.min(editor.duration, xToTime(cssW))
+  ctx.save()
+  ctx.beginPath()
+  for (let t = t0; t <= t1; t += grid) {
+    const x = Math.round(timeToX(t)) + 0.5
+    ctx.moveTo(x, RULER_H)
+    ctx.lineTo(x, cssH)
+  }
+  ctx.strokeStyle = 'rgba(148,163,184,0.09)'
+  ctx.lineWidth = 1
+  ctx.stroke()
+  ctx.restore()
+}
+
+/** 语谱图：把缓存位图按当前时间窗横向裁剪后拉伸绘制，与波形共用时间轴 */
+function drawSpectrogram(ctx: CanvasRenderingContext2D): void {
+  if (editor.viewMode === 'waveform') return
+  const spec = editor.spectrogram
+  if (!spec) return
+  if (specSource !== spec || !specBitmap) {
+    specBitmap = buildSpecBitmap(spec)
+    specSource = spec
+  }
+  const bmp = specBitmap
+  const sr = spec.sampleRate
+  const samplesPerCol = spec.hopSize > 0 ? spec.hopSize : spec.fftSize
+  const colAt = (x: number) => (xToTime(x) * sr) / samplesPerCol
+  let sx = colAt(0)
+  let sw = colAt(cssW) - sx
+  // 源矩形超出位图时按边界裁剪，同时等比修正目标矩形
+  let dx = 0
+  let dw = cssW
+  if (sx < 0) {
+    dw *= (sw + sx) / sw
+    dx = cssW - dw
+    sw += sx
+    sx = 0
+  }
+  if (sx + sw > bmp.width) {
+    const visible = bmp.width - sx
+    dw = dw * (visible / sw)
+    sw = visible
+  }
+  if (sw <= 0 || dw <= 0) return
+  ctx.save()
+  ctx.globalAlpha = editor.viewMode === 'both' ? 0.82 : 1
+  ctx.imageSmoothingEnabled = true
+  ctx.drawImage(bmp, sx, 0, sw, bmp.height, dx, RULER_H, dw, cssH - RULER_H)
+  ctx.restore()
+  // 频率刻度（右侧）
+  const maxFreq = Math.min(sr / 2, 24000)
+  const ratio = Math.log(maxFreq / SPEC_MIN_FREQ)
+  ctx.save()
+  ctx.font = '9px ui-monospace, monospace'
+  ctx.textAlign = 'right'
+  for (const f of [100, 500, 1000, 4000, 8000, 16000]) {
+    if (f >= maxFreq) continue
+    const y = RULER_H + (Math.log(maxFreq / f) / ratio) * (cssH - RULER_H)
+    ctx.fillStyle = 'rgba(4,6,12,0.6)'
+    ctx.fillRect(cssW - 38, y - 9, 36, 11)
+    ctx.fillStyle = 'rgba(226,232,240,0.75)'
+    ctx.fillText(f >= 1000 ? `${f / 1000}k` : `${f}`, cssW - 4, y)
+  }
+  ctx.restore()
+}
+
+/** 静音分段：暗色遮罩，方便一眼看出自动分段结果 */
+function drawSilenceSegments(ctx: CanvasRenderingContext2D): void {
+  const list = editor.segments
+  if (!list.length) return
+  ctx.save()
+  for (const seg of list) {
+    if (seg.kind !== 'silence') continue
+    const x1 = timeToX(seg.start)
+    const x2 = timeToX(seg.end)
+    if (x2 <= 0 || x1 >= cssW) continue
+    const l = Math.max(0, x1)
+    const r = Math.min(cssW, x2)
+    ctx.fillStyle = 'rgba(2,6,12,0.62)'
+    ctx.fillRect(l, RULER_H, r - l, cssH - RULER_H)
+    ctx.strokeStyle = 'rgba(251,191,36,0.35)'
+    ctx.setLineDash([3, 3])
+    ctx.beginPath()
+    ctx.moveTo(l + 0.5, RULER_H)
+    ctx.lineTo(l + 0.5, cssH)
+    ctx.moveTo(r - 0.5, RULER_H)
+    ctx.lineTo(r - 0.5, cssH)
+    ctx.stroke()
+    ctx.setLineDash([])
+  }
+  ctx.restore()
+}
+
+/** 标记点：刻度线 + 序号标签，落在标尺区的小三角便于点击定位 */
+function drawMarkers(ctx: CanvasRenderingContext2D): void {
+  const list = editor.markers
+  if (!list.length) return
+  ctx.save()
+  ctx.font = '9px ui-monospace, monospace'
+  ctx.textAlign = 'left'
+  list.forEach((m, i) => {
+    const x = timeToX(m.time)
+    if (x < -30 || x > cssW + 30) return
+    ctx.strokeStyle = 'rgba(251,191,36,0.75)'
+    ctx.lineWidth = 1
+    ctx.setLineDash([5, 4])
+    ctx.beginPath()
+    ctx.moveTo(x + 0.5, RULER_H)
+    ctx.lineTo(x + 0.5, cssH)
+    ctx.stroke()
+    ctx.setLineDash([])
+    ctx.fillStyle = '#fbbf24'
+    ctx.beginPath()
+    ctx.moveTo(x - 4, RULER_H - 1)
+    ctx.lineTo(x + 4, RULER_H - 1)
+    ctx.lineTo(x, RULER_H + 6)
+    ctx.closePath()
+    ctx.fill()
+    if (m.label) {
+      const label = `${i + 1} ${m.label}`
+      const w = Math.min(120, ctx.measureText(label).width + 8)
+      const lx = clamp(x + 3, 2, Math.max(2, cssW - w - 2))
+      ctx.fillStyle = 'rgba(4,6,12,0.82)'
+      ctx.fillRect(lx, RULER_H + 2, w, 13)
+      ctx.fillStyle = 'rgba(253,230,138,0.9)'
+      ctx.fillText(label.slice(0, 24), lx + 3, RULER_H + 12)
+    }
+  })
+  ctx.restore()
 }
 
 function drawRuler(ctx: CanvasRenderingContext2D): void {
@@ -336,6 +565,15 @@ function onPointerDown(e: PointerEvent): void {
   ;(e.target as HTMLElement).setPointerCapture(e.pointerId)
   const x = e.offsetX
   downX = x
+  // 点击标尺区的标记三角或其竖线：直接跳到该 Cue，不进入框选
+  if (!e.shiftKey && e.offsetY <= RULER_H + 12) {
+    const hit = editor.markers.find((m) => Math.abs(timeToX(m.time) - x) <= 5)
+    if (hit) {
+      editor.gotoMarker(hit.id)
+      dragMode = 'none'
+      return
+    }
+  }
   const t = xToTime(x)
   dragMode = 'none'
   if (editor.hasSelection) {
@@ -485,7 +723,12 @@ watch(
       editor.vGain,
       editor.buffer,
       editor.peakCache,
-      editor.peakVersion
+      editor.peakVersion,
+      editor.viewMode,
+      editor.spectrogram,
+      editor.markers,
+      editor.segments,
+      editor.snapGrid
     ] as const,
   () => {
     overlayDirty = true
@@ -537,6 +780,26 @@ watch(
       @pointercancel="onPointerUp"
       @pointerleave="onPointerLeave"
     />
+
+    <div class="absolute left-2 top-8 z-10 flex items-center gap-1 panel bg-abyss-900/90 px-1.5 py-1">
+      <span class="text-[9px] text-slate-500 mr-0.5 select-none">视图</span>
+      <button
+        v-for="m in viewModes"
+        :key="m.key"
+        class="btn px-1.5 py-0.5 text-[10px]"
+        :class="{ 'btn-primary': editor.viewMode === m.key }"
+        :disabled="!editor.buffer"
+        @click="editor.setViewMode(m.key)"
+      >
+        {{ m.label }}
+      </button>
+      <span
+        class="text-[9px] text-slate-500 ml-1 border-l border-neon/15 pl-1.5 select-none"
+        :title="`当前吸附精度：${gridLabel}，可在「标记」页切换`"
+      >
+        {{ gridLabel }}
+      </span>
+    </div>
 
     <div class="absolute right-2 top-8 z-10 flex items-center gap-1 panel bg-abyss-900/90 px-1.5 py-1">
       <button class="btn px-1.5 py-0.5 text-[10px]" :disabled="!editor.buffer" @click="fitAll">

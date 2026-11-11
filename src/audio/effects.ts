@@ -42,9 +42,11 @@ export function createEffectAudioNode(ctx: BaseAudioContext, spec: EffectNode): 
   switch (spec.kind) {
     case 'highpass':
     case 'lowpass':
+    case 'lowshelf':
+    case 'highshelf':
     case 'peaking': {
       const f = ctx.createBiquadFilter()
-      f.type = spec.kind === 'highpass' ? 'highpass' : spec.kind === 'lowpass' ? 'lowpass' : 'peaking'
+      f.type = spec.kind
       f.Q.value = 0.707
       updateEffectAudioNode(f, spec, false, 0)
       return f
@@ -70,11 +72,15 @@ export function updateEffectAudioNode(
   switch (spec.kind) {
     case 'highpass':
     case 'lowpass':
+    case 'lowshelf':
+    case 'highshelf':
     case 'peaking': {
       const f = node as BiquadFilterNode
       setParam(f.frequency, spec.hz, smooth, now)
       setParam(f.Q, spec.q, smooth, now)
-      if (spec.kind === 'peaking') setParam(f.gain, spec.gainDb, smooth, now)
+      if (spec.kind !== 'highpass' && spec.kind !== 'lowpass') {
+        setParam(f.gain, spec.gainDb, smooth, now)
+      }
       break
     }
     case 'compressor': {
